@@ -39,6 +39,19 @@ backend.
 - `@provider` pins don't apply, and Claude Code's WebSearch tool is not available.
 - `CLAUDE_OR_PROXY_LOG=<file>` logs proxy requests and errors.
 
+### Usage status line
+
+Each run shows usage at the bottom of Claude Code, refreshed every 30 seconds:
+
+```
+gpt-mini · OpenRouter $1.09 credits left · key $33.70/$50 left (monthly)
+gpt-6-sol · ChatGPT Plus · 5h 5% used, resets 4h39m · week 1% used, resets 6d23h
+```
+
+Results are cached in `~/.cache/claude-or/` (60s, kept across runs). If you
+already configure a `statusLine` or pass `--settings`, yours is used instead.
+`CLAUDE_OR_STATUSLINE=0` turns it off.
+
 `system-prompt.md` next to the script is appended to Claude Code's system prompt.
 See the header comment in `claude-or` for all options.
 

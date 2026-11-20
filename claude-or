@@ -30,6 +30,11 @@
 # subscription (CLAUDE_OR_CLASSIFIER_MODEL takes a ChatGPT slug there). See AUTO
 # MODE below for why the stock server-side check cannot work through OpenRouter.
 #
+# Usage status line: credits left (OpenRouter) or 5h/weekly plan limits
+# (ChatGPT) stay visible at the bottom of Claude Code, refreshed every 30s and
+# cached across runs. Skipped when you set your own statusLine or --settings;
+# CLAUDE_OR_STATUSLINE=0 turns it off. See USAGE STATUS LINE below.
+#
 # System prompt: system-prompt.md next to this script is appended to Claude
 # Code's own system prompt on every run (edit it to set a house style). Override
 # with CLAUDE_OR_SYSTEM_PROMPT (literal text) or CLAUDE_OR_SYSTEM_PROMPT_FILE (a
@@ -54,6 +59,112 @@ if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
   echo "claude-or $CLAUDE_OR_VERSION"; exit 0
 fi
 
+# ---- usage status line (internal: `claude-or --statusline <backend>`) ----
+# Third-party endpoints get no /usage or plan-limit display in Claude Code, so
+# each run injects a statusLine (via --settings) that calls back into this
+# script. It inherits Claude Code's env, so it reuses ANTHROPIC_AUTH_TOKEN: the
+# OpenRouter key, or in ChatGPT mode the proxy's token (the proxy fetches Codex's
+# wham/usage with its own refresh-safe login). Results are cached per backend in
+# ${XDG_CACHE_HOME:-~/.cache}/claude-or/ for 60s and kept across runs, so a new
+# session starts with the last known numbers and Claude Code's 30s refresh costs
+# at most one request a minute. A failed fetch shows the cached line, marked
+# "(stale)" once it is over 10 minutes old.
+usage_statusline_py() {
+  cat <<'PY'
+import json, os, sys, time, urllib.request
+
+backend = sys.argv[1] if len(sys.argv) > 1 else "openrouter"
+TTL, STALE = 60, 600
+cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "claude-or")
+cache = os.path.join(cache_dir, "usage-%s.json" % backend)
+token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+try:
+    session = json.load(sys.stdin)
+except Exception:
+    session = {}
+
+
+def get(url):
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=3) as r:
+        return json.load(r)
+
+
+def fetch():
+    if backend == "chatgpt":
+        return get(os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/") + "/claude-or/usage")
+    key = get("https://openrouter.ai/api/v1/key")["data"]
+    credits = get("https://openrouter.ai/api/v1/credits")["data"]
+    return {"key": {k: key.get(k) for k in ("limit", "limit_remaining", "limit_reset")},
+            "credits": credits}
+
+
+def dur(sec):
+    sec = max(0, int(sec or 0))
+    d, h, m = sec // 86400, sec % 86400 // 3600, sec % 3600 // 60
+    return "%dd%dh" % (d, h) if d else "%dh%02dm" % (h, m) if h else "%dm" % m
+
+
+def render(data, age):
+    parts = []
+    if backend == "chatgpt":
+        rl = data.get("rate_limit") or {}
+        parts.append("ChatGPT " + (data.get("plan_type") or "").title())
+        if rl.get("limit_reached"):
+            parts.append("LIMIT REACHED")
+        for name, w in (("primary", rl.get("primary_window")), ("secondary", rl.get("secondary_window"))):
+            if not w:
+                continue
+            secs = w.get("limit_window_seconds") or 0
+            label = "week" if secs >= 6 * 86400 else ("%dh" % (secs // 3600) if secs >= 3600 else name)
+            left = (w.get("reset_after_seconds") or 0) - age   # count down from the cached value
+            parts.append("%s %d%% used, resets %s" % (label, w.get("used_percent") or 0, dur(left)))
+        cr = data.get("credits") or {}
+        if cr.get("unlimited"):
+            parts.append("credits unlimited")
+        elif cr.get("has_credits"):
+            parts.append("credits %s" % cr.get("balance"))
+    else:
+        c, k = data.get("credits") or {}, data.get("key") or {}
+        left = (c.get("total_credits") or 0) - (c.get("total_usage") or 0)
+        parts.append("OpenRouter $%.2f credits left" % left)
+        if k.get("limit") is not None and k.get("limit_remaining") is not None:
+            parts.append("key $%.2f/$%g left%s" % (k["limit_remaining"], k["limit"],
+                         " (%s)" % k["limit_reset"] if k.get("limit_reset") else ""))
+    line = " · ".join(parts)
+    model = (session.get("model") or {}).get("display_name")
+    if model:
+        line = model + " · " + line
+    return line + (" (stale)" if age > STALE else "")
+
+
+cached = None
+try:
+    with open(cache) as f:
+        cached = json.load(f)
+except Exception:
+    pass
+now = time.time()
+if not cached or now - cached.get("t", 0) > TTL:
+    try:
+        cached = {"t": now, "data": fetch()}
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp = "%s.%d.tmp" % (cache, os.getpid())
+        with open(tmp, "w") as f:
+            json.dump(cached, f)
+        os.replace(tmp, cache)
+    except Exception:
+        pass
+if cached:
+    print(render(cached["data"], now - cached.get("t", now)))
+else:
+    print("usage unavailable")
+PY
+}
+if [[ "${1:-}" == "--statusline" ]]; then
+  exec python3 -I -c "$(usage_statusline_py)" "${2:-openrouter}"
+fi
+
 # ---- tested Claude Code version ----
 # Last Claude Code version this script was checked against. On launch, a newer
 # installed version prints a one-line note (silence: CLAUDE_OR_NO_VERSION_CHECK=1).
@@ -62,7 +173,7 @@ fi
 #   - env vars: ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL/SMALL_FAST_MODEL/DEFAULT_*_MODEL,
 #     CLAUDE_CODE_SUBAGENT_MODEL, CLAUDE_CODE_EXTRA_BODY,
 #     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC (and the per-piece DISABLE_* vars),
-#     CLAUDE_CODE_DISABLE_FEATURE_FLAGS, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
+#     CLAUDE_CODE_DISABLE_FEATURE_FLAGS, ENABLE_CLAUDEAI_MCP_SERVERS, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
 #     (and its 10k-uncached-token ceiling), CLAUDE_CODE_MAX_CONTEXT_TOKENS,
 #     CLAUDE_CODE_MAX_OUTPUT_TOKENS (no auto-retry at a max_tokens error since 2.1.329)
 #   - auto mode: CLAUDE_CODE_AUTO_MODE_SERVER, CLAUDE_CODE_AUTO_MODE_MODEL,
@@ -70,7 +181,9 @@ fi
 #   - skill sync: ~/.claude/skills/synced/<bucket>/manifest.json layout, the
 #     firstParty gate, ~/.claude/plugins/synced, --plugin-dir, plugin.json schema
 #   - session title gating on nonessential traffic
-#   - flags: --append-system-prompt, --dangerously-skip-permissions
+#   - flags: --append-system-prompt, --dangerously-skip-permissions, --settings
+#   - status line: statusLine {type, command, refreshInterval} schema, stdin JSON
+#     (model.display_name), env inherited by the command
 #   - ChatGPT proxy: the Messages request shape it translates (role "system"
 #     messages, thinking signatures echoed back, output_config.effort, tool_choice)
 TESTED_CC_VERSION="2.1.329"
@@ -322,6 +435,11 @@ export DISABLE_BUG_COMMAND=1
 export DISABLE_FEEDBACK_COMMAND=1
 export DISABLE_AUTOUPDATER=1
 export CLAUDE_CODE_DISABLE_FEATURE_FLAGS=1
+# claude.ai connectors only load under a claude.ai login, which ANTHROPIC_AUTH_TOKEN
+# outranks, so each launch printed "⚠ claude.ai connectors are disabled because
+# ANTHROPIC_API_KEY or another auth source is set ..." (2.1.329). Turning the
+# loading off loses nothing here and drops the warning.
+export ENABLE_CLAUDEAI_MCP_SERVERS="${ENABLE_CLAUDEAI_MCP_SERVERS:-false}"
 
 # ---- prompt suggestions (the greyed next-prompt ghost text) ----
 # Off by default here: the feature is gated on a GrowthBook flag that a
@@ -590,6 +708,7 @@ chatgpt_proxy_py() {
 import base64, fcntl, http.server, json, os, sys, threading, time, urllib.error, urllib.request, uuid
 
 UPSTREAM = "https://chatgpt.com/backend-api/codex/responses"
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"   # what Codex's /status reads
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"   # Codex CLI's OAuth client
 AUTH_FILE = os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "auth.json")
@@ -915,14 +1034,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
 
+    def authorised(self):
+        return not SECRET or self.headers.get("x-api-key") == SECRET or \
+            self.headers.get("Authorization") == "Bearer " + SECRET
+
     def do_GET(self):
-        self.send_json(200, {"ok": True})
+        if self.path.split("?")[0] != "/claude-or/usage":
+            return self.send_json(200, {"ok": True})
+        # For the status line: it shares this process's token handling, so it never
+        # refreshes (and rotates) the Codex login on its own.
+        if not self.authorised():
+            return self.send_err(401, "bad proxy token")
+        for attempt in (0, 1):
+            try:
+                access, account = credentials(force=attempt == 1)
+                req = urllib.request.Request(USAGE_URL, headers={
+                    "Authorization": "Bearer " + access, "chatgpt-account-id": account,
+                    "originator": "codex_cli_rs", "Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    u = json.load(r)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    continue
+                return self.send_err(502, "usage: HTTP %d" % e.code)
+            except Exception as e:
+                return self.send_err(502, "usage: %s" % e)
+        # Only what the status line shows; the payload also carries email/account ids.
+        self.send_json(200, {k: u.get(k) for k in ("plan_type", "rate_limit", "credits", "rate_limit_reached_type")})
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n)
-        if SECRET and self.headers.get("x-api-key") != SECRET and \
-                self.headers.get("Authorization") != "Bearer " + SECRET:
+        if not self.authorised():
             return self.send_err(401, "bad proxy token")
         try:
             body = json.loads(raw or b"{}")
@@ -1026,6 +1170,34 @@ sys.exit(0 if tok.get("refresh_token") else 1)' "$CODEX_AUTH" 2>/dev/null; then
   fi
   export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
   export ANTHROPIC_AUTH_TOKEN="$PROXY_SECRET"
+fi
+
+# ---- usage status line ----
+# Shows credits left (OpenRouter) or plan limits (ChatGPT) at the bottom of
+# Claude Code; see the --statusline section at the top. --settings outranks the
+# user's settings files, so skip it when they already set a statusLine (user,
+# project, or local settings) or pass their own --settings.
+# CLAUDE_OR_STATUSLINE=0 turns it off.
+STATUSLINE=1
+case "${CLAUDE_OR_STATUSLINE:-}" in 0|false|off) STATUSLINE=0 ;; esac
+for a in ${ARGS[@]+"${ARGS[@]}"}; do
+  case "$a" in --settings|--settings=*) STATUSLINE=0 ;; esac
+done
+if (( STATUSLINE )); then
+  SL_SETTINGS="$(python3 -I -c '
+import json, os, shlex, sys
+self_path, backend = sys.argv[1:3]
+for f in (os.path.expanduser("~/.claude/settings.json"), ".claude/settings.json",
+          ".claude/settings.local.json"):
+    try:
+        if json.load(open(f)).get("statusLine"):
+            raise SystemExit
+    except (OSError, ValueError, AttributeError):
+        pass
+cmd = "%s --statusline %s" % (shlex.quote(self_path), backend)
+print(json.dumps({"statusLine": {"type": "command", "command": cmd, "refreshInterval": 30}}))' \
+    "$(readlink -f "${BASH_SOURCE[0]}")" "$BACKEND" 2>/dev/null || true)"
+  [[ -n "$SL_SETTINGS" ]] && set -- --settings "$SL_SETTINGS" "$@"
 fi
 
 if [[ -z "${CLAUDE_OR_NO_VERSION_CHECK:-}" ]]; then

@@ -8,6 +8,14 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
+Added
+- Usage status line: OpenRouter credits left (and key limit), or ChatGPT plan
+  5h/weekly limits with reset times, always visible and cached across runs.
+  Off with CLAUDE_OR_STATUSLINE=0; skipped if you set your own statusLine.
+
+Fixed
+- No more "claude.ai connectors are disabled" warning on every launch
+  (connectors can't load under OpenRouter/ChatGPT auth anyway).
 
 
 [1.2.0] - 2026-11-21

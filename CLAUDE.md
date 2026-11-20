@@ -18,7 +18,7 @@ no dependencies beyond `bash`, `python3` (stdlib only, inline `-I -c` snippets),
 - `changelog.txt` — release history (rules below).
 
 ### Flow of `claude-or` (top to bottom)
-1. Version flag → `TESTED_CC_VERSION` → `MODELS`/`ORDER` aliases → load `.env`.
+1. Version flag → `--statusline` mode → `TESTED_CC_VERSION` → `MODELS`/`ORDER` aliases → load `.env`.
 2. Pick model (arg, number, alias, or raw ID); split optional `@provider` pin.
 3. Parse permission flags (`--auto` default, `--no-auto`, `--permission-mode`).
 4. Per-alias tables: `EFFORT`, `CONTEXT`, `MAXOUT`; else live lookup from
@@ -34,7 +34,9 @@ no dependencies beyond `bash`, `python3` (stdlib only, inline `-I -c` snippets),
     (`chatgpt_proxy_py`, Anthropic Messages → Codex Responses, auth from
     `~/.codex/auth.json`) and point `ANTHROPIC_BASE_URL` at it. It must write
     refreshed tokens back to `auth.json`, or Codex gets logged out.
-11. Version check; `exec claude` (the proxy exits when that PID does).
+11. Inject a usage `statusLine` via `--settings` (unless the user has one); it calls
+    back into `claude-or --statusline <backend>` (handled at the very top of the script).
+12. Version check; `exec claude` (the proxy exits when that PID does).
 
 ## Conventions
 - Keep it one file. Keep `set -euo pipefail` safe: guard optional vars with `${VAR:-}`
