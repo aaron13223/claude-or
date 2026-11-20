@@ -8,6 +8,10 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
+
+
+[1.3.0] - 2026-11-21
+--------------------
 Added
 - Usage status line: OpenRouter credits left (and key limit), or ChatGPT plan
   5h/weekly limits with reset times, always visible and cached across runs.
