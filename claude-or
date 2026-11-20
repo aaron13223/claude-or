@@ -30,9 +30,11 @@
 # subscription (CLAUDE_OR_CLASSIFIER_MODEL takes a ChatGPT slug there). See AUTO
 # MODE below for why the stock server-side check cannot work through OpenRouter.
 #
-# Usage status line: credits left (OpenRouter) or 5h/weekly plan limits
-# (ChatGPT) stay visible at the bottom of Claude Code, refreshed every 30s and
-# cached across runs. Skipped when you set your own statusLine or --settings;
+# Usage status line: this session's cost (OpenRouter, exact dollars) or tokens
+# and plan points used (ChatGPT), plus credits left or 5h/weekly plan limits,
+# stay visible at the bottom of Claude Code, refreshed every 30s and cached
+# across runs. On OpenRouter this routes requests through a local pass-through
+# to read each response's cost. Skipped when you set your own statusLine or --settings;
 # CLAUDE_OR_STATUSLINE=0 turns it off. See USAGE STATUS LINE below.
 #
 # System prompt: system-prompt.md next to this script is appended to Claude
@@ -62,13 +64,19 @@ fi
 # ---- usage status line (internal: `claude-or --statusline <backend>`) ----
 # Third-party endpoints get no /usage or plan-limit display in Claude Code, so
 # each run injects a statusLine (via --settings) that calls back into this
-# script. It inherits Claude Code's env, so it reuses ANTHROPIC_AUTH_TOKEN: the
-# OpenRouter key, or in ChatGPT mode the proxy's token (the proxy fetches Codex's
-# wham/usage with its own refresh-safe login). Results are cached per backend in
-# ${XDG_CACHE_HOME:-~/.cache}/claude-or/ for 60s and kept across runs, so a new
-# session starts with the last known numbers and Claude Code's 30s refresh costs
-# at most one request a minute. A failed fetch shows the cached line, marked
-# "(stale)" once it is over 10 minutes old.
+# script. It inherits Claude Code's env: with the local proxy running
+# (ANTHROPIC_BASE_URL on 127.0.0.1) it asks the proxy, which holds the real
+# credentials (the OpenRouter key, or Codex's refresh-safe login for wham/usage);
+# without it, it calls OpenRouter with ANTHROPIC_AUTH_TOKEN. Account results are
+# cached per backend in ${XDG_CACHE_HOME:-~/.cache}/claude-or/ for 60s and kept
+# across runs, so a new session starts with the last known numbers and Claude
+# Code's 30s refresh costs at most one request a minute. A failed fetch shows the
+# cached line, marked "(stale)" once it is over 10 minutes old.
+# This session's share comes from sessions/<session_id>.json, which the proxy
+# writes after each response: exact dollars on OpenRouter, tokens on ChatGPT plus
+# the points of each plan window used since the session started (tracked in
+# sessions/<session_id>.plan.json, across window resets). The plan windows only
+# report whole percents, so small sessions read +0%.
 usage_statusline_py() {
   cat <<'PY'
 import json, os, sys, time, urllib.request
@@ -78,6 +86,8 @@ TTL, STALE = 60, 600
 cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "claude-or")
 cache = os.path.join(cache_dir, "usage-%s.json" % backend)
 token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+base = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+sess_dir = os.path.join(cache_dir, "sessions")
 try:
     session = json.load(sys.stdin)
 except Exception:
@@ -91,8 +101,8 @@ def get(url):
 
 
 def fetch():
-    if backend == "chatgpt":
-        return get(os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/") + "/claude-or/usage")
+    if base.startswith("http://127.0.0.1:"):
+        return get(base + "/claude-or/usage")
     key = get("https://openrouter.ai/api/v1/key")["data"]
     credits = get("https://openrouter.ai/api/v1/credits")["data"]
     return {"key": {k: key.get(k) for k in ("limit", "limit_remaining", "limit_reset")},
@@ -105,9 +115,83 @@ def dur(sec):
     return "%dd%dh" % (d, h) if d else "%dh%02dm" % (h, m) if h else "%dm" % m
 
 
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save(path, obj):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def tokens(n):
+    return "%.1fM" % (n / 1e6) if n >= 1e6 else "%dk" % round(n / 1e3) if n >= 1e3 else str(n)
+
+
+def window_label(w, name):
+    secs = w.get("limit_window_seconds") or 0
+    return "week" if secs >= 6 * 86400 else ("%dh" % (secs // 3600) if secs >= 3600 else name)
+
+
+def plan_delta(sid, data):
+    # Points of each window used since this session's first render. A window that
+    # rolls over (reset_at jumps) banks what was used so far and restarts at 0.
+    path = os.path.join(sess_dir, sid + ".plan.json")
+    plan = load(path) or {}
+    out = []
+    rl = data.get("rate_limit") or {}
+    for name in ("primary_window", "secondary_window"):
+        w = rl.get(name)
+        if not w:
+            continue
+        used, reset = w.get("used_percent") or 0, w.get("reset_at") or 0
+        b = plan.get(name)
+        if not b:
+            b = plan[name] = {"reset_at": reset, "base": used, "last": used, "carry": 0}
+        elif reset > b["reset_at"] + 60:
+            b.update(carry=b["carry"] + max(0, b["last"] - b["base"]), base=0, reset_at=reset, last=used)
+        else:
+            b["last"] = used
+        out.append((window_label(w, name), b["carry"] + max(0, b["last"] - b["base"])))
+    save(path, plan)
+    return out
+
+
+def session_part(data):
+    sid = str(session.get("session_id") or "")
+    if not sid.replace("-", "").isalnum():
+        return None
+    st = load(os.path.join(sess_dir, sid + ".json")) or {}
+    if backend == "chatgpt":
+        n = sum(st.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens",
+                                       "cache_creation_input_tokens", "output_tokens"))
+        bits = ["session %s tok" % tokens(n)]
+        if data:
+            bits += ["+%d%% %s" % (d, label) for label, d in plan_delta(sid, data)
+                     if d or label != "week"]
+        return ", ".join(bits)
+    cost = st.get("cost_usd")
+    if cost is None:
+        # Nothing recorded yet, or going direct (no proxy) so nothing can be.
+        return "session $0" if base.startswith("http://127.0.0.1:") else None
+    return "session $%.2f" % cost if cost >= 1 else "session $%.4f" % cost
+
+
 def render(data, age):
     parts = []
-    if backend == "chatgpt":
+    if data is None:
+        parts.append("usage unavailable")
+    elif backend == "chatgpt":
         rl = data.get("rate_limit") or {}
         parts.append("ChatGPT " + (data.get("plan_type") or "").title())
         if rl.get("limit_reached"):
@@ -115,8 +199,7 @@ def render(data, age):
         for name, w in (("primary", rl.get("primary_window")), ("secondary", rl.get("secondary_window"))):
             if not w:
                 continue
-            secs = w.get("limit_window_seconds") or 0
-            label = "week" if secs >= 6 * 86400 else ("%dh" % (secs // 3600) if secs >= 3600 else name)
+            label = window_label(w, name)
             left = (w.get("reset_after_seconds") or 0) - age   # count down from the cached value
             parts.append("%s %d%% used, resets %s" % (label, w.get("used_percent") or 0, dur(left)))
         cr = data.get("credits") or {}
@@ -131,11 +214,13 @@ def render(data, age):
         if k.get("limit") is not None and k.get("limit_remaining") is not None:
             parts.append("key $%.2f/$%g left%s" % (k["limit_remaining"], k["limit"],
                          " (%s)" % k["limit_reset"] if k.get("limit_reset") else ""))
-    line = " · ".join(parts)
+    sp = session_part(data)
+    if sp:
+        parts.insert(0, sp)
     model = (session.get("model") or {}).get("display_name")
     if model:
-        line = model + " · " + line
-    return line + (" (stale)" if age > STALE else "")
+        parts.insert(0, model)
+    return " · ".join(parts) + (" (stale)" if age > STALE else "")
 
 
 cached = None
@@ -155,10 +240,7 @@ if not cached or now - cached.get("t", 0) > TTL:
         os.replace(tmp, cache)
     except Exception:
         pass
-if cached:
-    print(render(cached["data"], now - cached.get("t", now)))
-else:
-    print("usage unavailable")
+print(render(cached["data"] if cached else None, now - cached.get("t", now) if cached else 0))
 PY
 }
 if [[ "${1:-}" == "--statusline" ]]; then
@@ -183,7 +265,9 @@ fi
 #   - session title gating on nonessential traffic
 #   - flags: --append-system-prompt, --dangerously-skip-permissions, --settings
 #   - status line: statusLine {type, command, refreshInterval} schema, stdin JSON
-#     (model.display_name), env inherited by the command
+#     (model.display_name, session_id), env inherited by the command
+#   - session cost: metadata.user_id format (JSON with session_id), OpenRouter's
+#     usage.cost on the final message_delta
 #   - ChatGPT proxy: the Messages request shape it translates (role "system"
 #     messages, thinking signatures echoed back, output_config.effort, tool_choice)
 TESTED_CC_VERSION="2.1.329"
@@ -686,7 +770,7 @@ if (( ! PROMPT_SKIP )); then
 fi
 [[ -n "$PROMPT_TEXT" ]] && set -- --append-system-prompt "$PROMPT_TEXT" "$@"
 
-# ---- ChatGPT subscription (local proxy) ----
+# ---- local proxy: ChatGPT subscription, OpenRouter cost tap ----
 # Claude Code only speaks Anthropic Messages; a ChatGPT plan is only reachable
 # through the Codex backend (chatgpt.com/backend-api/codex/responses), which
 # speaks the OpenAI Responses API with the Codex CLI's OAuth tokens. So ChatGPT
@@ -703,9 +787,13 @@ fi
 #     dropped; count_tokens is a bytes/4 estimate.
 # The proxy accepts only a per-run random token (ANTHROPIC_AUTH_TOKEN) and exits
 # within 2s of this PID going away; exec keeps the PID, so that is Claude Code's.
-chatgpt_proxy_py() {
+local_proxy_py() {
   cat <<'PY'
-import base64, fcntl, http.server, json, os, sys, threading, time, urllib.error, urllib.request, uuid
+import base64, fcntl, http.server, json, os, re, sys, threading, time, urllib.error, urllib.request, uuid
+
+MODE = os.environ.get("CLAUDE_OR_PROXY_MODE", "chatgpt")   # or "openrouter" (pass-through tap)
+OR_BASE = "https://openrouter.ai/api"
+OR_KEY = os.environ.pop("CLAUDE_OR_UPSTREAM_KEY", "")
 
 UPSTREAM = "https://chatgpt.com/backend-api/codex/responses"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"   # what Codex's /status reads
@@ -717,6 +805,53 @@ PARENT = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 DEBUG = os.environ.get("CLAUDE_OR_PROXY_LOG", "")
 SIG_PREFIX = "cor1:"   # thinking-block signature carrying the Responses reasoning item
 lock = threading.Lock()
+SESS_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                        "claude-or", "sessions")
+sess_lock = threading.Lock()
+sessions = {}
+
+
+# ---------- per-session usage (read by the status line) ----------
+def session_id(body):
+    # Claude Code puts its session id in metadata.user_id: a JSON string since
+    # 2.1.x, "user_..._session_<uuid>" before that.
+    uid = str((body.get("metadata") or {}).get("user_id") or "")
+    try:
+        sid = json.loads(uid).get("session_id")
+    except (ValueError, AttributeError):
+        m = re.search(r"session_([0-9a-fA-F-]{36})", uid)
+        sid = m and m.group(1)
+    return sid if sid and re.fullmatch(r"[A-Za-z0-9-]{8,64}", str(sid)) else None
+
+
+def record(sid, usage):
+    if not sid or not isinstance(usage, dict):
+        return
+    path = os.path.join(SESS_DIR, sid + ".json")
+    with sess_lock:
+        st = sessions.get(sid)
+        if st is None:
+            try:
+                with open(path) as f:
+                    st = json.load(f)   # resumed session: keep counting from its total
+            except Exception:
+                st = {}
+            sessions[sid] = st
+        st["backend"] = MODE
+        st["requests"] = st.get("requests", 0) + 1
+        for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
+            st[k] = st.get(k, 0) + (usage.get(k) or 0)
+        if usage.get("cost") is not None:   # OpenRouter's exact charge for this request
+            st["cost_usd"] = st.get("cost_usd", 0) + float(usage["cost"])
+        st["updated"] = time.time()
+        try:
+            os.makedirs(SESS_DIR, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
 
 def log(*a):
@@ -1040,11 +1175,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.split("?")[0] != "/claude-or/usage":
+            if MODE == "openrouter":
+                return self.passthrough("GET", None, None) if self.authorised() else self.send_err(401, "bad proxy token")
             return self.send_json(200, {"ok": True})
         # For the status line: it shares this process's token handling, so it never
         # refreshes (and rotates) the Codex login on its own.
         if not self.authorised():
             return self.send_err(401, "bad proxy token")
+        if MODE == "openrouter":
+            try:
+                h = {"Authorization": "Bearer " + OR_KEY}
+                with urllib.request.urlopen(urllib.request.Request(OR_BASE + "/v1/key", headers=h), timeout=5) as r:
+                    key = json.load(r)["data"]
+                with urllib.request.urlopen(urllib.request.Request(OR_BASE + "/v1/credits", headers=h), timeout=5) as r:
+                    credits = json.load(r)["data"]
+            except Exception as e:
+                return self.send_err(502, "usage: %s" % e)
+            return self.send_json(200, {"key": {k: key.get(k) for k in ("limit", "limit_remaining", "limit_reset")},
+                                        "credits": credits})
         for attempt in (0, 1):
             try:
                 access, account = credentials(force=attempt == 1)
@@ -1071,7 +1219,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             body = json.loads(raw or b"{}")
         except ValueError:
-            return self.send_err(400, "invalid JSON")
+            body = {}
+            if MODE != "openrouter":
+                return self.send_err(400, "invalid JSON")
+        if MODE == "openrouter":
+            return self.passthrough("POST", raw, body)
+        sid = session_id(body)
         path = self.path.split("?")[0]
         if path.endswith("/count_tokens"):
             return self.send_json(200, {"input_tokens": len(raw) // 4})
@@ -1115,6 +1268,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             events = translate(resp, model)
             if not body.get("stream"):
                 msg, err = collect(events)
+                if msg:
+                    record(sid, msg.get("usage"))
                 return self.send_json(200, msg) if msg else self.send_err(502, err["error"]["message"])
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -1126,8 +1281,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for name, ev in events:
                     self.wfile.write(("event: %s\ndata: %s\n\n" % (name, json.dumps(ev))).encode())
                     self.wfile.flush()
+                    if name == "message_delta":
+                        record(sid, ev.get("usage"))
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+    # OpenRouter mode: forward bytes unchanged, only reading usage (which carries
+    # OpenRouter's exact `cost`) off the final message_delta / JSON body.
+    HOP = {"host", "content-length", "authorization", "x-api-key", "connection", "keep-alive",
+           "accept-encoding", "transfer-encoding", "te", "upgrade", "proxy-connection"}
+
+    def passthrough(self, method, raw, body):
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in self.HOP}
+        headers["Authorization"] = "Bearer " + OR_KEY
+        headers["Accept-Encoding"] = "identity"   # so usage can be read off the stream
+        req = urllib.request.Request(OR_BASE + self.path, raw if method == "POST" else None, headers, method=method)
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+        except urllib.error.HTTPError as e:
+            resp = e   # pass errors through as-is so Claude Code's own handling applies
+        except Exception as e:
+            return self.send_err(502, "OpenRouter unreachable: %s" % e)
+        sid = session_id(body) if body else None
+        try:
+            status = getattr(resp, "status", None) or resp.code
+            self.send_response(status)
+            for k, v in resp.headers.items():
+                if k.lower() not in ("content-length", "transfer-encoding", "connection", "content-encoding"):
+                    self.send_header(k, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            if "text/event-stream" in (resp.headers.get("Content-Type") or ""):
+                for line in resp:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                    if sid and line.startswith(b"data:") and b'"message_delta"' in line:
+                        try:
+                            record(sid, json.loads(line[5:]).get("usage"))
+                        except ValueError:
+                            pass
+            else:
+                data = resp.read()
+                self.wfile.write(data)
+                if sid and status == 200:
+                    try:
+                        record(sid, json.loads(data).get("usage"))
+                    except (ValueError, AttributeError):
+                        pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            resp.close()
 
 
 def watch_parent():
@@ -1151,38 +1356,17 @@ srv.serve_forever()
 PY
 }
 
-if [[ "$BACKEND" == chatgpt ]]; then
-  CODEX_AUTH="${CODEX_HOME:-$HOME/.codex}/auth.json"
-  if ! python3 -I -c '
-import json, sys
-tok = json.load(open(sys.argv[1])).get("tokens") or {}
-sys.exit(0 if tok.get("refresh_token") else 1)' "$CODEX_AUTH" 2>/dev/null; then
-    echo "No ChatGPT login in $CODEX_AUTH. Run: codex login" >&2; exit 1
-  fi
-  PROXY_SECRET="$(head -c 32 /dev/urandom | md5sum | cut -d' ' -f1)"
-  exec {PROXY_FD}< <(CLAUDE_OR_PROXY_SECRET="$PROXY_SECRET" exec python3 -I -c "$(chatgpt_proxy_py)" "$$" \
-                       </dev/null 2>>"${CLAUDE_OR_PROXY_LOG:-/dev/null}")
-  PROXY_PORT=""
-  read -r -t 10 -u "$PROXY_FD" PROXY_PORT || true
-  exec {PROXY_FD}<&-
-  if [[ ! "$PROXY_PORT" =~ ^[0-9]+$ ]]; then
-    echo "ChatGPT proxy failed to start (set CLAUDE_OR_PROXY_LOG=<file> to see why)" >&2; exit 1
-  fi
-  export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
-  export ANTHROPIC_AUTH_TOKEN="$PROXY_SECRET"
-fi
-
 # ---- usage status line ----
-# Shows credits left (OpenRouter) or plan limits (ChatGPT) at the bottom of
-# Claude Code; see the --statusline section at the top. --settings outranks the
-# user's settings files, so skip it when they already set a statusLine (user,
-# project, or local settings) or pass their own --settings.
-# CLAUDE_OR_STATUSLINE=0 turns it off.
+# Shows usage at the bottom of Claude Code; see the --statusline section at the
+# top. --settings outranks the user's settings files, so skip it when they
+# already set a statusLine (user, project, or local settings) or pass their own
+# --settings. CLAUDE_OR_STATUSLINE=0 turns it off.
 STATUSLINE=1
 case "${CLAUDE_OR_STATUSLINE:-}" in 0|false|off) STATUSLINE=0 ;; esac
 for a in ${ARGS[@]+"${ARGS[@]}"}; do
   case "$a" in --settings|--settings=*) STATUSLINE=0 ;; esac
 done
+SL_SETTINGS=""
 if (( STATUSLINE )); then
   SL_SETTINGS="$(python3 -I -c '
 import json, os, shlex, sys
@@ -1197,8 +1381,50 @@ for f in (os.path.expanduser("~/.claude/settings.json"), ".claude/settings.json"
 cmd = "%s --statusline %s" % (shlex.quote(self_path), backend)
 print(json.dumps({"statusLine": {"type": "command", "command": cmd, "refreshInterval": 30}}))' \
     "$(readlink -f "${BASH_SOURCE[0]}")" "$BACKEND" 2>/dev/null || true)"
-  [[ -n "$SL_SETTINGS" ]] && set -- --settings "$SL_SETTINGS" "$@"
 fi
+
+# ---- start the local proxy ----
+# ChatGPT mode always needs it (translation). OpenRouter mode uses it only to show
+# what this session cost: Claude Code drops OpenRouter's per-response `cost` before
+# writing transcripts, so the proxy forwards requests byte-for-byte and adds each
+# response's cost to the session's total (keyed by the session id Claude Code puts
+# in metadata.user_id). It also covers side requests (classifier, titles,
+# suggestions, subagents), which never reach the transcript. Without the status
+# line there is nothing to show, so OpenRouter then goes direct; if the proxy
+# fails to start it also goes direct, without the session cost.
+start_proxy() {
+  PROXY_SECRET="$(head -c 32 /dev/urandom | md5sum | cut -d' ' -f1)"
+  exec {PROXY_FD}< <(CLAUDE_OR_PROXY_SECRET="$PROXY_SECRET" CLAUDE_OR_PROXY_MODE="$BACKEND" \
+                     CLAUDE_OR_UPSTREAM_KEY="${OPENROUTER_API_KEY:-}" \
+                     exec python3 -I -c "$(local_proxy_py)" "$$" \
+                       </dev/null 2>>"${CLAUDE_OR_PROXY_LOG:-/dev/null}")
+  PROXY_PORT=""
+  read -r -t 10 -u "$PROXY_FD" PROXY_PORT || true
+  exec {PROXY_FD}<&-
+  [[ "$PROXY_PORT" =~ ^[0-9]+$ ]]
+}
+if [[ "$BACKEND" == chatgpt ]]; then
+  CODEX_AUTH="${CODEX_HOME:-$HOME/.codex}/auth.json"
+  if ! python3 -I -c '
+import json, sys
+tok = json.load(open(sys.argv[1])).get("tokens") or {}
+sys.exit(0 if tok.get("refresh_token") else 1)' "$CODEX_AUTH" 2>/dev/null; then
+    echo "No ChatGPT login in $CODEX_AUTH. Run: codex login" >&2; exit 1
+  fi
+  if ! start_proxy; then
+    echo "ChatGPT proxy failed to start (set CLAUDE_OR_PROXY_LOG=<file> to see why)" >&2; exit 1
+  fi
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
+  export ANTHROPIC_AUTH_TOKEN="$PROXY_SECRET"
+elif [[ -n "$SL_SETTINGS" ]]; then
+  if start_proxy; then
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
+    export ANTHROPIC_AUTH_TOKEN="$PROXY_SECRET"
+  else
+    echo "→ note: usage proxy failed to start; going direct to OpenRouter (no session cost)" >&2
+  fi
+fi
+[[ -n "$SL_SETTINGS" ]] && set -- --settings "$SL_SETTINGS" "$@"
 
 if [[ -z "${CLAUDE_OR_NO_VERSION_CHECK:-}" ]]; then
   CC_VERSION="$(claude --version 2>/dev/null | awk '{print $1}')" || CC_VERSION=""

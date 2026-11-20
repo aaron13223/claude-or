@@ -30,12 +30,13 @@ no dependencies beyond `bash`, `python3` (stdlib only, inline `-I -c` snippets),
    pin so the classifier request is not refused. ChatGPT mode uses `gpt-6-luna`, no pins.
 8. Merge provider prefs and reasoning effort into `CLAUDE_CODE_EXTRA_BODY` (splice, never overwrite user JSON).
 9. Append system prompt unless the caller passed their own.
-10. ChatGPT backend (`chatgpt:<slug>` models): start the embedded stdlib proxy
-    (`chatgpt_proxy_py`, Anthropic Messages → Codex Responses, auth from
-    `~/.codex/auth.json`) and point `ANTHROPIC_BASE_URL` at it. It must write
-    refreshed tokens back to `auth.json`, or Codex gets logged out.
-11. Inject a usage `statusLine` via `--settings` (unless the user has one); it calls
-    back into `claude-or --statusline <backend>` (handled at the very top of the script).
+10. Decide on the usage `statusLine` (skipped if the user has one); it calls back into
+    `claude-or --statusline <backend>` (handled at the very top of the script).
+11. Start the embedded stdlib proxy (`local_proxy_py`) and point `ANTHROPIC_BASE_URL`
+    at it. ChatGPT mode always (Anthropic Messages → Codex Responses, auth from
+    `~/.codex/auth.json`; it must write refreshed tokens back, or Codex gets logged
+    out). OpenRouter mode only with the status line: a byte-for-byte pass-through
+    that sums `usage.cost` per session into `~/.cache/claude-or/sessions/`.
 12. Version check; `exec claude` (the proxy exits when that PID does).
 
 ## Conventions

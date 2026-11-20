@@ -44,9 +44,17 @@ backend.
 Each run shows usage at the bottom of Claude Code, refreshed every 30 seconds:
 
 ```
-gpt-mini · OpenRouter $1.09 credits left · key $33.70/$50 left (monthly)
-gpt-6-sol · ChatGPT Plus · 5h 5% used, resets 4h39m · week 1% used, resets 6d23h
+gpt-6-luna · session $0.0027 · OpenRouter $1.09 credits left · key $33.70/$50 left (monthly)
+gpt-6-sol · session 26k tok, +0% 5h · ChatGPT Plus · 5h 18% used, resets 4h24m · week 3% used, resets 6d23h
 ```
+
+- **session**: what this session has used so far, including side requests
+  (safety classifier, titles, subagents). On OpenRouter it is the exact dollar
+  cost OpenRouter reports per response; on ChatGPT, tokens plus the points of
+  each plan window used since the session started (whole percents only).
+  Totals are kept in `~/.cache/claude-or/sessions/`.
+- On OpenRouter, this sends requests through a small local pass-through that
+  forwards them unchanged; with the status line off they go direct.
 
 Results are cached in `~/.cache/claude-or/` (60s, kept across runs). If you
 already configure a `statusLine` or pass `--settings`, yours is used instead.

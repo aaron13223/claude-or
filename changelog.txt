@@ -8,6 +8,14 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
+Added
+- Status line shows what the current session has used: exact dollar cost on
+  OpenRouter, tokens and plan-limit points on ChatGPT. Includes side requests
+  (classifier, titles, subagents) and persists per session.
+
+Changed
+- With the status line on, OpenRouter requests go through a local pass-through
+  (forwarded unchanged) so each response's cost can be counted.
 
 
 [1.3.0] - 2026-11-21
