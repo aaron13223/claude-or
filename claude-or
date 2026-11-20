@@ -9,6 +9,7 @@
 #   ./claude-or deepseek            # deepseek runs at reasoning effort "max" (see EFFORT below)
 #   ./claude-or deepseek --no-auto  # bypass every permission prompt (the old default)
 #   ./claude-or --list              # show aliases
+#   ./claude-or --version           # print wrapper version
 #
 # Reads OPENROUTER_API_KEY from .env next to this script.
 #
@@ -35,6 +36,12 @@
 # those via a generated local plugin, .skills-plugin/ next to itself.
 
 set -euo pipefail
+
+# ---- wrapper version (SemVer; must match the top entry in changelog.txt) ----
+CLAUDE_OR_VERSION="1.1.0"
+if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+  echo "claude-or $CLAUDE_OR_VERSION"; exit 0
+fi
 
 # ---- tested Claude Code version ----
 # Last Claude Code version this script was checked against. On launch, a newer

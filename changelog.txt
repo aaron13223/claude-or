@@ -1,0 +1,37 @@
+Changelog
+=========
+
+All notable changes to claude-or are recorded here.
+Format: based on Keep a Changelog (https://keepachangelog.com/en/1.1.0/).
+Versioning: Semantic Versioning 2.0.0 (https://semver.org/).
+Newest release first. Dates are YYYY-MM-DD.
+
+[Unreleased]
+------------
+
+
+[1.1.0] - 2026-11-21
+--------------------
+Added
+- `--version` / `-V` flag; CLAUDE_OR_VERSION constant in claude-or.
+- changelog.txt, CLAUDE.md, README.md, .env.example.
+
+Changed
+- .gitignore now ignores .env and the generated .skills-plugin/.
+
+
+[1.0.0] - 2026-11-21
+--------------------
+Added
+- First release: claude-or launches Claude Code against OpenRouter.
+- Model aliases (gpt, gpt-mini, grok, gemini, gemini-flash, deepseek, qwen,
+  kimi, glm, claude) and interactive picker; any OpenRouter model ID accepted.
+- `alias@provider` pins (provider.only, no fallbacks).
+- Per-alias reasoning effort, context window, and output token cap, with live
+  lookup from OpenRouter for unknown models or command-line pins.
+- Auto permission mode via local classifier (anthropic/claude-haiku-5.5);
+  `--no-auto` to bypass prompts.
+- Appended system prompt from system-prompt.md (overridable by env vars).
+- Account skill re-exposure via generated .skills-plugin/.
+- Prompt suggestions forced on; telemetry and nonessential traffic disabled.
+- Warning when installed Claude Code is newer than TESTED_CC_VERSION.
