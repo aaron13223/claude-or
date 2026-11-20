@@ -11,3 +11,6 @@
 *.swp
 .vscode/
 .idea/
+
+# Python
+__pycache__/

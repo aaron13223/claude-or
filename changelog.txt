@@ -8,6 +8,33 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
+Added
+- CLAUDE_OR_DEFAULT_MODEL: Enter at the model menu picks it, and a flag as the
+  first argument (`./claude-or -p "hi"`, `./claude-or --no-auto`) runs it.
+- Your own aliases in ~/.config/claude-or/aliases (or CLAUDE_OR_ALIASES_FILE),
+  with optional context=, maxout= and effort=, so updates never conflict.
+- `--doctor`: checks the OpenRouter key, Codex login, Claude Code version,
+  status line and skills sync without launching.
+- `--check-aliases`: compares every alias's model, provider pin, context window
+  and output cap with OpenRouter and the Codex model cache.
+- Test suite for the ChatGPT proxy and launch logic
+  (`python3 -m unittest discover -s tests`).
+
+Changed
+- Faster launch: Claude Code's version is cached until it updates, and
+  OpenRouter endpoint lookups for a day (a stale copy is used when offline).
+- Per-session usage totals older than 30 days are deleted.
+
+Fixed
+- claude-or exited silently with status 1 on machines without synced account
+  skills (no ~/.claude/skills/synced), or with skills but no synced plugins.
+- Pressing Enter at the model menu crashed with "bad array subscript"; it now
+  asks again (or picks the default).
+- A flag as the first argument failed with "Unknown alias".
+- An invalid CLAUDE_CODE_EXTRA_BODY silently dropped the provider pin and
+  reasoning effort; the launch now stops with an error.
+- Provider pins and effort values containing quotes produced invalid JSON.
+- Launching failed under bash older than 4.4 when no plugins were loaded.
 
 
 [1.4.0] - 2026-11-21

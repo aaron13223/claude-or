@@ -23,7 +23,27 @@ For the ChatGPT aliases only, skip `.env` and run `codex login` once instead.
 ./claude-or x-ai/grok-4.7 -p "hi"   # any OpenRouter model ID
 ./claude-or chatgpt         # ChatGPT subscription instead of OpenRouter billing
 ./claude-or chatgpt:gpt-6-luna      # any ChatGPT/Codex model slug
+./claude-or --doctor        # check key, Codex login, Claude Code version, status line
+./claude-or --check-aliases # compare alias tables with OpenRouter (maintenance)
 ```
+
+Set `CLAUDE_OR_DEFAULT_MODEL` (in your shell or `.env`) to choose what Enter
+picks in the menu and what runs when you start with a flag (`./claude-or -p "hi"`).
+
+### Your own aliases
+
+Add or replace aliases in `~/.config/claude-or/aliases` (or the file
+`CLAUDE_OR_ALIASES_FILE` names) instead of editing the script:
+
+```
+# alias    model-id[@provider]                   options
+mymodel    vendor/some-model@some-provider      context=128000
+gpt        openai/gpt-6.2-sol                    effort=high
+```
+
+Options: `context=N`, `maxout=N`, `effort=LEVEL` (`effort=default` clears it).
+Replacing a built-in alias drops its built-in context/output values; they are
+then looked up from OpenRouter unless you give them.
 
 ### ChatGPT subscription
 
@@ -59,6 +79,15 @@ gpt-6-sol · session 26k tok, +0% 5h · ChatGPT Plus · 5h 18% used, resets 4h24
 Results are cached in `~/.cache/claude-or/` (60s, kept across runs). If you
 already configure a `statusLine` or pass `--settings`, yours is used instead.
 `CLAUDE_OR_STATUSLINE=0` turns it off.
+
+### Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+Stdlib only and offline: launch tests run a copy of the script with a fake
+`claude` on `PATH`, so your `.env` is never read.
 
 `system-prompt.md` next to the script is appended to Claude Code's system prompt.
 See the header comment in `claude-or` for all options.

@@ -12,8 +12,22 @@
 #   ./claude-or chatgpt             # ChatGPT subscription (gpt-6-sol), no OpenRouter billing
 #   ./claude-or --list              # show aliases
 #   ./claude-or --version           # print wrapper version
+#   ./claude-or --doctor            # check key, Codex login, Claude Code, status line
+#   ./claude-or --check-aliases     # compare alias tables with OpenRouter (maintenance)
 #
 # Reads OPENROUTER_API_KEY from .env next to this script (OpenRouter models only).
+#
+# Default model: CLAUDE_OR_DEFAULT_MODEL (an alias or model ID, also settable in
+# .env) is what Enter picks in the menu, and what runs when the first argument
+# is a flag (`./claude-or -p "hi"`, `./claude-or --no-auto`).
+#
+# Your own aliases: ${XDG_CONFIG_HOME:-~/.config}/claude-or/aliases (or the file
+# CLAUDE_OR_ALIASES_FILE names) adds or replaces aliases without editing this
+# script. See YOUR OWN ALIASES below for the format.
+#
+# Caches (${XDG_CACHE_HOME:-~/.cache}/claude-or/): Claude Code's version (until
+# it updates), OpenRouter endpoint lookups (a day), usage, and per-session
+# totals (deleted after 30 days).
 #
 # ChatGPT subscription: `./claude-or chatgpt` (or any `chatgpt:<slug>`, e.g.
 # chatgpt:gpt-6-luna) bills your ChatGPT plan instead of OpenRouter. It reuses
@@ -272,7 +286,9 @@ fi
 #     messages, thinking signatures echoed back, output_config.effort, tool_choice)
 TESTED_CC_VERSION="2.1.329"
 
-DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-or"
 
 # ---- model aliases (edit freely; IDs from https://openrouter.ai/models) ----
 # Pinned models get a `@provider` suffix. Suffix syntax is a wrapper feature: it's
@@ -297,27 +313,436 @@ declare -A MODELS=(
 )
 ORDER=(gpt gpt-mini grok gemini gemini-flash deepseek qwen kimi glm claude chatgpt chatgpt-mini)
 
-list() {
-  printf '%-14s %s\n' ALIAS MODEL
-  for k in "${ORDER[@]}"; do printf '%-14s %s\n' "$k" "${MODELS[$k]}"; done
-}
+# ---- per-alias tables: reasoning effort, context window, output cap ----
+# Reasoning effort: OpenRouter exposes one cross-model knob, `reasoning.effort`
+# (`reasoning.max_tokens` is the token-budget alternative; per-model thinking
+# budgets differ too much to pin here). "max" spends ~95% of the output cap. Key
+# on the alias, or on a provider prefix a model ID starts with (so a bare
+# `deepseek/...` ID gets it too).
+declare -A EFFORT=(
+  [deepseek]="max"
+)
+# Context window: Claude Code only knows Claude models' windows. For anything
+# else it warns 'Model "..." isn't recognized · context assumed to be 1m tokens'
+# and auto-compacts against that guess. CLAUDE_CODE_MAX_CONTEXT_TOKENS gives it
+# the real window and silences the warning. Values are OpenRouter's
+# context_length for the alias's routing (the pinned provider's when the alias
+# has a pin, since providers can serve a smaller window than the model's max). A
+# pin typed on the command line, or a model ID not listed here, is looked up
+# live from OpenRouter. An explicit CLAUDE_CODE_MAX_CONTEXT_TOKENS wins.
+declare -A CONTEXT=(
+  [gpt]=1050000
+  [gpt-mini]=1050000
+  [grok]=500000
+  [gemini]=1048576
+  [gemini-flash]=1048576
+  [deepseek]=1040000     # inference-net/us serves 1,040,000 (model max is 1,048,576)
+  [qwen]=1000000
+  [kimi]=1048576
+  [glm]=262000           # tenstorrent/fp8; most providers serve 262,144
+  [claude]=1000000
+  [chatgpt]=272000       # context_window in ~/.codex/models_cache.json
+  [chatgpt-mini]=272000
+)
+# Output token cap: since 2.1.329 Claude Code no longer retries at the limit a
+# `max_tokens` error names, so a provider that takes fewer output tokens than
+# Claude Code asks for (32k by default) fails the request.
+# CLAUDE_CODE_MAX_OUTPUT_TOKENS is exported only when the cap is under
+# OUTPUT_FLOOR: setting a big cap would make Claude Code ask for it, and
+# OpenRouter reserves credit for the full max_tokens. Values: smallest
+# max_completion_tokens across the alias's routing (only the ones under the
+# floor need listing; anything else is looked up live with the context window).
+# An explicit CLAUDE_CODE_MAX_OUTPUT_TOKENS wins. `--check-aliases` compares
+# both tables with OpenRouter.
+OUTPUT_FLOOR=32000
+declare -A MAXOUT=(
+  # none of the current aliases: every provider they route to takes >= 65,536
+)
 
 # ---- load .env ----
 if [[ -f "$DIR/.env" ]]; then
   set -a; . "$DIR/.env"; set +a
 fi
+DEFAULT_MODEL="${CLAUDE_OR_DEFAULT_MODEL:-}"
+
+# ---- your own aliases ----
+# The built-in aliases live in this file, so editing them conflicts with the
+# next update. Aliases in ALIASES_FILE are merged over them, one per line:
+#   <alias> <model-id>[@provider] [context=N] [maxout=N] [effort=LEVEL]
+#   e.g.  mymodel  vendor/some-model@some-provider  context=128000 effort=high
+# Blank lines and `#` comments are ignored. A line for an existing alias
+# replaces it, and that alias's built-in context/max-output values are dropped
+# (they describe the old routing), so the live lookup fills them unless given.
+# The alias's effort is kept unless effort= is given; effort=default clears it.
+ALIASES_FILE="${CLAUDE_OR_ALIASES_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-or/aliases}"
+USER_ALIASES=0
+if [[ -n "${CLAUDE_OR_ALIASES_FILE:-}" && ! -f "$ALIASES_FILE" ]]; then
+  echo "CLAUDE_OR_ALIASES_FILE not found: $ALIASES_FILE" >&2; exit 1
+fi
+if [[ -f "$ALIASES_FILE" ]]; then
+  lineno=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno+1))
+    read -ra f <<<"${line%%#*}" || true
+    (( ${#f[@]} )) || continue
+    where="$ALIASES_FILE:$lineno"
+    name="${f[0]}"; model="${f[1]:-}"
+    if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      echo "→ note: $where: skipped, bad alias name '$name' (letters, digits, . _ -)" >&2; continue
+    fi
+    if [[ "$model" != */* && "$model" != chatgpt:?* ]]; then
+      echo "→ note: $where: skipped, '$model' is not a model ID (vendor/model or chatgpt:<slug>)" >&2; continue
+    fi
+    [[ -z "${MODELS[$name]+x}" ]] && ORDER+=("$name")
+    MODELS[$name]="$model"
+    unset "CONTEXT[$name]" "MAXOUT[$name]"
+    for o in "${f[@]:2}"; do
+      case "$o" in
+        context=*|maxout=*)
+          v="${o#*=}"
+          if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+            echo "→ note: $where: ignored '$o' (needs a number)" >&2
+          elif [[ "$o" == context=* ]]; then CONTEXT[$name]="$v"
+          else MAXOUT[$name]="$v"; fi ;;
+        effort=default) unset "EFFORT[$name]" ;;
+        effort=?*) EFFORT[$name]="${o#*=}" ;;
+        *) echo "→ note: $where: ignored unknown option '$o'" >&2 ;;
+      esac
+    done
+    USER_ALIASES=$((USER_ALIASES+1))
+  done <"$ALIASES_FILE"
+fi
+
+list() {
+  printf '%-14s %s\n' ALIAS MODEL
+  for k in "${ORDER[@]}"; do
+    printf '%-14s %s%s\n' "$k" "${MODELS[$k]}" "$([[ "$k" == "$DEFAULT_MODEL" ]] && echo '  (default)')"
+  done
+}
+
+# ---- OpenRouter endpoint lookups (Python prelude shared by the snippets) ----
+# endpoints(model, key) returns OpenRouter's endpoint list for a model. Each
+# lookup used to cost up to 3s before every launch, and a provider's limits
+# rarely change, so results are cached for a day in $CACHE_DIR/endpoints/; a
+# failed fetch falls back to a stale copy. fresh=True (--check-aliases) skips
+# the cache. matches() is how OpenRouter matches a provider slug in `only`: its
+# exact tag, every variant under it ("z-ai" selects "z-ai/fp4"), or the
+# display name.
+or_endpoints_py() {
+  cat <<'PY'
+import json, os, re, sys, time, urllib.error, urllib.request
+
+EP_TTL = 86400
+EP_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                      "claude-or", "endpoints")
+
+
+def endpoints(model, key, fresh=False):
+    path = os.path.join(EP_DIR, re.sub(r"[^A-Za-z0-9._-]", "_", model) + ".json")
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        age = None
+    if age is not None and age < EP_TTL and not fresh:
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    req = urllib.request.Request("https://openrouter.ai/api/v1/models/" + model + "/endpoints",
+                                 headers={"Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            eps = json.load(r)["data"]["endpoints"]
+    except Exception:
+        if age is None or fresh:
+            raise
+        with open(path) as f:
+            return json.load(f)
+    try:
+        os.makedirs(EP_DIR, exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w") as f:
+            json.dump(eps, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return eps
+
+
+def matches(slug, e):
+    tag = e.get("tag") or ""
+    return slug in (tag, e.get("provider_name")) or tag.startswith(slug + "/")
+
+
+def serves(slug, eps):
+    return any(matches(slug, e) for e in eps)
+
+
+def limits(eps, pin=""):
+    # Pinned: that provider's limits. Unpinned: the smallest any provider serves,
+    # since OpenRouter may route to any of them.
+    if pin:
+        eps = [e for e in eps if matches(pin, e)]
+    ctx = [e["context_length"] for e in eps if e.get("context_length")]
+    out = [e["max_completion_tokens"] for e in eps if e.get("max_completion_tokens")]
+    return (min(ctx) if ctx else None), (min(out) if out else None)
+PY
+}
+
+# ---- --check-aliases: compare the alias tables with OpenRouter and Codex ----
+# For maintenance (CLAUDE.md: alias values come from the endpoints API). Fetches
+# fresh, so it also refreshes the endpoint cache. Exits 1 if anything is off.
+check_aliases() {
+  local k rows=()
+  for k in "${ORDER[@]}"; do
+    rows+=("$k" "${MODELS[$k]}" "${CONTEXT[$k]:-}" "${MAXOUT[$k]:-}")
+  done
+  python3 -I -c "$(or_endpoints_py)"$'\n''
+key, floor, rows = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+codex = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+bad = 0
+
+
+def report(status, alias, msg):
+    print("%-5s %-14s %s" % (status, alias, msg), flush=True)
+
+
+def codex_models():
+    try:
+        with open(os.path.join(codex, "models_cache.json")) as f:
+            return json.load(f)["models"]
+    except Exception:
+        return None
+
+
+for i in range(0, len(rows), 4):
+    alias, spec, ctx, maxout = rows[i:i + 4]
+    model, pin = spec.rsplit("@", 1) if "@" in spec else (spec, "")
+    ctx, maxout = (int(ctx) if ctx else None), (int(maxout) if maxout else None)
+    if model.startswith("chatgpt:"):
+        models = codex_models()
+        if models is None:
+            report("skip", alias, "no Codex model cache (run `codex` once)")
+            continue
+        m = next((m for m in models if m.get("slug") == model[8:]), None)
+        if not m:
+            bad += 1
+            report("FAIL", alias, "%s is not in the Codex model cache" % model[8:])
+        elif ctx and m.get("context_window") and m["context_window"] != ctx:
+            bad += 1
+            report("FAIL", alias, "CONTEXT %d, Codex says %d" % (ctx, m["context_window"]))
+        else:
+            report("ok", alias, spec)
+        continue
+    try:
+        eps = endpoints(model, key, fresh=True)
+    except urllib.error.HTTPError as e:
+        bad += 1
+        report("FAIL", alias, "%s: HTTP %d%s" % (model, e.code, " (no such model)" if e.code == 404 else ""))
+        continue
+    except Exception as e:
+        bad += 1
+        report("FAIL", alias, "%s: lookup failed (%s)" % (model, e))
+        continue
+    if not eps:
+        bad += 1
+        report("FAIL", alias, "%s has no endpoints" % model)
+        continue
+    if pin and not serves(pin, eps):
+        bad += 1
+        tags = sorted({e.get("tag") or e.get("provider_name") or "?" for e in eps})
+        report("FAIL", alias, "provider %s does not serve %s (serves: %s)" % (pin, model, ", ".join(tags)))
+        continue
+    live_ctx, live_out = limits(eps, pin)
+    want_out = live_out if live_out and live_out < floor else None
+    problems = []
+    if ctx is None:
+        problems.append("no CONTEXT entry (looked up each launch; OpenRouter: %s)" % live_ctx)
+    elif live_ctx and ctx != live_ctx:
+        problems.append("CONTEXT %d, OpenRouter serves %d" % (ctx, live_ctx))
+    if maxout != want_out:
+        problems.append("MAXOUT %s, should be %s" % (maxout or "unset", want_out or "unset"))
+    if problems and not (ctx is None and len(problems) == 1):
+        bad += 1
+        report("FAIL", alias, "%s: %s" % (spec, "; ".join(problems)))
+    elif problems:
+        report("note", alias, "%s: %s" % (spec, problems[0]))
+    else:
+        report("ok", alias, "%s (context %s, max output %s)" % (spec, live_ctx, live_out))
+print("%d alias(es) need attention" % bad if bad else "all aliases match")
+sys.exit(1 if bad else 0)' "${OPENROUTER_API_KEY:-}" "$OUTPUT_FLOOR" "${rows[@]}"
+}
+
+# ---- settings checks shared by --doctor and the status line ----
+# Prints the first settings file that already sets a statusLine (ours would
+# outrank it through --settings, so it is skipped then).
+user_statusline_file() {
+  python3 -I -c '
+import json, os
+for f in (os.path.expanduser("~/.claude/settings.json"), ".claude/settings.json",
+          ".claude/settings.local.json"):
+    try:
+        with open(f) as fh:
+            if json.load(fh).get("statusLine"):
+                print(f); break
+    except (OSError, ValueError, AttributeError):
+        pass' 2>/dev/null || true
+}
+# The account skills sync root holds one bucket directory; dot-files sit beside it.
+# Without the directory, find fails and pipefail would end the whole launch.
+skills_sync_dir() {
+  find "$HOME/.claude/skills/synced" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 || true
+}
+
+# ---- Claude Code version (cached) ----
+# `claude --version` starts Node (a few hundred ms on every launch), so the
+# answer is cached with the resolved binary path and reused until that path
+# changes or the binary is newer than the cache (an update replaces it).
+cc_version() {
+  local bin line="" cache="$CACHE_DIR/cc-version"
+  bin="$(command -v claude 2>/dev/null)" || return 0
+  bin="$(readlink -f "$bin")"
+  if [[ -f "$cache" && ! "$bin" -nt "$cache" ]]; then
+    IFS= read -r line <"$cache" || true      # "<path>\t<version>"
+    if [[ "${line%%$'\t'*}" == "$bin" ]]; then echo "${line#*$'\t'}"; return 0; fi
+  fi
+  line="$(claude --version 2>/dev/null | awk '{print $1}')" || line=""
+  if [[ -n "$line" ]]; then
+    { mkdir -p "$CACHE_DIR" && printf '%s\t%s\n' "$bin" "$line" >"$cache.$$" \
+        && mv -f "$cache.$$" "$cache"; } 2>/dev/null || true
+  fi
+  echo "$line"
+}
+
+# ---- --doctor: check the setup without launching ----
+doctor() {
+  local fails=0 warns=0 v newest n f
+  ok()   { printf 'ok    %s\n' "$*"; }
+  warn() { printf 'warn  %s\n' "$*"; warns=$((warns+1)); }
+  fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails+1)); }
+
+  ok "claude-or $CLAUDE_OR_VERSION, bash $BASH_VERSION, $(python3 --version 2>&1)"
+  if ! command -v claude >/dev/null; then
+    fail "claude is not on PATH"
+  else
+    v="$(claude --version 2>/dev/null | awk '{print $1}')" || v=""
+    newest="$(printf '%s\n%s\n' "$TESTED_CC_VERSION" "${v:-0}" | sort -V | tail -1)"
+    if [[ -z "$v" ]]; then warn "claude --version printed nothing"
+    elif [[ "$v" == "$TESTED_CC_VERSION" ]]; then ok "Claude Code $v (the tested version)"
+    elif [[ "$newest" == "$v" ]]; then warn "Claude Code $v is newer than tested $TESTED_CC_VERSION; see TESTED_CC_VERSION in $SELF"
+    else warn "Claude Code $v is older than tested $TESTED_CC_VERSION; consider \`claude update\`"
+    fi
+  fi
+
+  if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    warn "no OPENROUTER_API_KEY in $DIR/.env (only the chatgpt aliases will work)"
+  else
+    # Prints a status word, then a message; never the key.
+    read -r v f < <(python3 -I -c '
+import json, sys, urllib.error, urllib.request
+h = {"Authorization": "Bearer " + sys.argv[1]}
+def get(url):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=5) as r:
+        return json.load(r)["data"]
+try:
+    k = get("https://openrouter.ai/api/v1/key")
+    c = get("https://openrouter.ai/api/v1/credits")
+except urllib.error.HTTPError as e:
+    print("fail", "OpenRouter rejected the key (HTTP %d)" % e.code); raise SystemExit
+except Exception as e:
+    print("warn", "could not reach OpenRouter (%s)" % e); raise SystemExit
+left = (c.get("total_credits") or 0) - (c.get("total_usage") or 0)
+lim = "" if k.get("limit") is None else ", key limit $%.2f of $%g left" % (k.get("limit_remaining") or 0, k["limit"])
+print("ok", "OpenRouter key works: $%.2f credits left%s" % (left, lim))' "$OPENROUTER_API_KEY" 2>/dev/null || echo "warn OpenRouter check crashed")
+    case "$v" in ok) ok "$f" ;; fail) fail "$f" ;; *) warn "$f" ;; esac
+  fi
+
+  f="${CODEX_HOME:-$HOME/.codex}"
+  read -r v n < <(python3 -I -c '
+import json, sys, time, base64
+try:
+    tok = json.load(open(sys.argv[1] + "/auth.json")).get("tokens") or {}
+except Exception:
+    print("none"); raise SystemExit
+if not tok.get("refresh_token"):
+    print("none"); raise SystemExit
+try:
+    p = tok["access_token"].split(".")[1]
+    exp = json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))["exp"]
+    print("ok", "access token valid" if exp > time.time() else "access token expired, refreshed on first request")
+except Exception:
+    print("ok", "access token unreadable, refreshed on first request")' "$f" 2>/dev/null || echo none)
+  if [[ "$v" == ok ]]; then ok "ChatGPT login in $f/auth.json ($n)"
+  else warn "no ChatGPT login in $f/auth.json (chatgpt aliases need \`codex login\`)"; fi
+  if [[ "$v" == ok && ! -f "$f/models_cache.json" ]]; then
+    warn "no $f/models_cache.json: chatgpt:<slug> context windows can't be looked up (run \`codex\` once)"
+  fi
+
+  if [[ -n "$DEFAULT_MODEL" ]]; then
+    v="${DEFAULT_MODEL%@*}"; v="${MODELS[$v]:-$v}"
+    if [[ "$v" == */* || "$v" == chatgpt:?* ]]; then ok "default model: $DEFAULT_MODEL"
+    else fail "CLAUDE_OR_DEFAULT_MODEL=$DEFAULT_MODEL is not an alias or model ID"; fi
+  fi
+  if [[ -f "$ALIASES_FILE" ]]; then ok "$USER_ALIASES alias(es) from $ALIASES_FILE"; fi
+
+  case "${CLAUDE_OR_STATUSLINE:-}" in
+    0|false|off) ok "usage status line off (CLAUDE_OR_STATUSLINE)" ;;
+    *) f="$(user_statusline_file)"
+       if [[ -n "$f" ]]; then warn "usage status line skipped: $f already sets a statusLine"
+       else ok "usage status line on"; fi ;;
+  esac
+
+  f="$(skills_sync_dir)"
+  if [[ -z "$f" ]]; then
+    ok "no synced account skills (a first-party Claude Code login syncs them)"
+  else
+    n="$(find "$f" -mindepth 2 -maxdepth 2 -name SKILL.md 2>/dev/null | wc -l || true)"
+    v="$(md5sum "$f/manifest.json" 2>/dev/null | cut -d' ' -f1 || true)"
+    if [[ "$(cat "$DIR/.skills-plugin/.stamp" 2>/dev/null)" == "$v" ]]; then
+      ok "account skills: $n synced, local plugin up to date"
+    else
+      ok "account skills: $n synced, local plugin rebuilds on next launch"
+    fi
+  fi
+
+  n="$(find "$CACHE_DIR/sessions" -name '*.json' 2>/dev/null | wc -l || true)"
+  ok "cache: $CACHE_DIR ($n session file(s); older than 30 days are deleted)"
+
+  echo "$fails problem(s), $warns warning(s)"
+  (( fails == 0 ))
+}
 
 # ---- pick model ----
+# A flag as the first argument (`-p`, `--no-auto`) means no model was named:
+# run CLAUDE_OR_DEFAULT_MODEL, or ask, and keep every argument for later.
 choice="${1:-}"
-if [[ "$choice" == "--list" || "$choice" == "-l" ]]; then list; exit 0; fi
+case "$choice" in
+  --list|-l) list; exit 0 ;;
+  --check-aliases) check_aliases; exit ;;
+  --doctor) doctor; exit ;;
+esac
 
-if [[ -z "$choice" ]]; then
-  echo "Select a model:"
-  i=1
-  for k in "${ORDER[@]}"; do printf '  %2d) %-14s %s\n' "$i" "$k" "${MODELS[$k]}"; i=$((i+1)); done
-  read -rp "Number, alias, or OpenRouter model ID: " choice
-  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ORDER[@]} )); then
-    choice="${ORDER[choice-1]}"
+if [[ -z "$choice" || "$choice" == -* ]]; then
+  if [[ -n "$choice" && -n "$DEFAULT_MODEL" ]]; then
+    choice="$DEFAULT_MODEL"
+  elif [[ -n "$choice" && ! -t 0 ]]; then
+    echo "No model given ('$choice' is a flag): put a model first, or set CLAUDE_OR_DEFAULT_MODEL" >&2; exit 1
+  else
+    choice=""
+    echo "Select a model:"
+    i=1
+    for k in "${ORDER[@]}"; do printf '  %2d) %-14s %s\n' "$i" "$k" "${MODELS[$k]}"; i=$((i+1)); done
+    while [[ -z "$choice" ]]; do
+      if ! read -rp "Number, alias, or OpenRouter model ID${DEFAULT_MODEL:+ [$DEFAULT_MODEL]}: " choice; then
+        echo >&2; echo "No model chosen." >&2; exit 1
+      fi
+      choice="${choice//[[:space:]]/}"
+      [[ -z "$choice" ]] && choice="$DEFAULT_MODEL"
+    done
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ORDER[@]} )); then
+      choice="${ORDER[choice-1]}"
+    fi
   fi
 else
   shift
@@ -377,14 +802,7 @@ while (( $# )); do
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
-# ---- reasoning effort (per alias) ----
-# OpenRouter exposes one cross-model knob, `reasoning.effort` (`reasoning.max_tokens`
-# is the token-budget alternative; per-model thinking budgets differ too much to pin
-# here). "max" spends ~95% of the output cap. Key on the alias, or on a provider
-# prefix a model ID starts with (so a bare `deepseek/...` ID gets it too).
-declare -A EFFORT=(
-  [deepseek]="max"
-)
+# ---- reasoning effort (EFFORT table at the top) ----
 effort="${EFFORT[$choice]:-}"
 if [[ -z "$effort" ]]; then
   for k in "${!EFFORT[@]}"; do
@@ -392,42 +810,7 @@ if [[ -z "$effort" ]]; then
   done
 fi
 
-# ---- context window (per alias) ----
-# Claude Code only knows Claude models' windows. For anything else it warns
-# 'Model "..." isn't recognized · context assumed to be 1m tokens' and
-# auto-compacts against that guess. CLAUDE_CODE_MAX_CONTEXT_TOKENS gives it the
-# real window and silences the warning. Values are OpenRouter's context_length
-# for the alias's routing (the pinned provider's when the alias has a pin, since
-# providers can serve a smaller window than the model's max). A pin typed on the
-# command line, or a model ID not listed here, is looked up live from
-# OpenRouter. An explicit CLAUDE_CODE_MAX_CONTEXT_TOKENS in the environment wins.
-declare -A CONTEXT=(
-  [gpt]=1050000
-  [gpt-mini]=1050000
-  [grok]=500000
-  [gemini]=1048576
-  [gemini-flash]=1048576
-  [deepseek]=1040000     # inference-net/us serves 1,040,000 (model max is 1,048,576)
-  [qwen]=1000000
-  [kimi]=1048576
-  [glm]=262000           # tenstorrent/fp8; most providers serve 262,144
-  [claude]=1000000
-  [chatgpt]=272000       # context_window in ~/.codex/models_cache.json
-  [chatgpt-mini]=272000
-)
-# ---- output token cap (per alias) ----
-# Since 2.1.329 Claude Code no longer retries at the limit a `max_tokens` error
-# names, so a provider that takes fewer output tokens than Claude Code asks for
-# (32k by default) fails the request. CLAUDE_CODE_MAX_OUTPUT_TOKENS is exported
-# only when the cap is under OUTPUT_FLOOR: setting a big cap would make Claude
-# Code ask for it, and OpenRouter reserves credit for the full max_tokens.
-# Values: smallest max_completion_tokens across the alias's routing (only the
-# ones under the floor need listing; anything else is looked up live with the
-# context window). An explicit CLAUDE_CODE_MAX_OUTPUT_TOKENS wins.
-OUTPUT_FLOOR=32000
-declare -A MAXOUT=(
-  # none of the current aliases: every provider they route to takes >= 65,536
-)
+# ---- context window and output cap (CONTEXT / MAXOUT tables at the top) ----
 OUT="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-}"
 OUT_SET=0; [[ -n "$OUT" ]] && OUT_SET=1
 
@@ -454,26 +837,14 @@ print(next((m["context_window"] for m in models
   fi
 elif [[ -z "$CTX" || -z "$OUT" ]]; then
   {
-    # Pinned: that provider's limits. Unpinned: the smallest any provider serves,
-    # since OpenRouter may route to any of them. Prints "<context> <output>".
-    read -r LIVE_CTX LIVE_OUT < <(python3 -I -c '
-import json, sys, urllib.request
+    # Prints "<context> <output>" (see limits() in or_endpoints_py).
+    read -r LIVE_CTX LIVE_OUT < <(python3 -I -c "$(or_endpoints_py)"$'\n''
 model, pin, key = sys.argv[1:4]
-req = urllib.request.Request(
-    "https://openrouter.ai/api/v1/models/" + model + "/endpoints",
-    headers={"Authorization": "Bearer " + key})
 try:
-    with urllib.request.urlopen(req, timeout=3) as r:
-        eps = json.load(r)["data"]["endpoints"]
+    ctx, out = limits(endpoints(model, key), pin)
 except Exception:
     raise SystemExit
-if pin:
-    # "z-ai" pins every z-ai/* endpoint variant, as OpenRouter matches it.
-    eps = [e for e in eps if pin in (e.get("tag"), e.get("provider_name"))
-           or (e.get("tag") or "").startswith(pin + "/")]
-ctx = [e["context_length"] for e in eps if e.get("context_length")]
-out = [e["max_completion_tokens"] for e in eps if e.get("max_completion_tokens")]
-print(min(ctx) if ctx else "-", min(out) if out else "-")' "$MODEL" "$PROVIDER" "$OPENROUTER_API_KEY" 2>/dev/null || true) || true
+print(ctx or "-", out or "-")' "$MODEL" "$PROVIDER" "$OPENROUTER_API_KEY" 2>/dev/null || true) || true
     [[ -z "$CTX" && "${LIVE_CTX:--}" != "-" ]] && CTX="$LIVE_CTX"
     [[ -z "$OUT" && "${LIVE_OUT:--}" != "-" ]] && OUT="$LIVE_OUT"
     [[ -z "$CTX" ]] && echo "→ note: couldn't look up the context window for $MODEL; Claude Code will assume one" >&2
@@ -552,9 +923,8 @@ fi
 # (/schedule, /usage-credits, /insights etc. are account-entitlement upsells and
 # cannot be restored this way — don't expect them here.)
 SKILLS_PLUGIN="$DIR/.skills-plugin"
-# The sync root holds one bucket directory; dot-files (lock/marker) sit beside it.
-SYNC_DIR="$(find "$HOME/.claude/skills/synced" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
-SYNC_STAMP="$(md5sum "$SYNC_DIR/manifest.json" 2>/dev/null | cut -d' ' -f1)"
+SYNC_DIR="$(skills_sync_dir)"
+SYNC_STAMP="$(md5sum "$SYNC_DIR/manifest.json" 2>/dev/null | cut -d' ' -f1 || true)"
 
 # Skills worth carrying over: the ones whose work is done in files. Left out on
 # purpose: browser/computer-use (need tools this session doesn't have) and
@@ -580,7 +950,7 @@ if [[ -n "$SYNC_DIR" && -n "$SYNC_STAMP" ]]; then
     build_skills_plugin "$SKILLS_PLUGIN"
   fi
   # Same idea for the account plugins Claude Code syncs from claude.ai.
-  SYNCED_PLUGINS="$(find "$HOME/.claude/plugins/synced" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
+  SYNCED_PLUGINS="$(find "$HOME/.claude/plugins/synced" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 || true)"
   PLUGIN_ARGS=(--plugin-dir "$SKILLS_PLUGIN")
   [[ -n "$SYNCED_PLUGINS" ]] && PLUGIN_ARGS+=(--plugin-dir "$SYNCED_PLUGINS")
 else
@@ -635,24 +1005,10 @@ if (( AUTO_MODE )); then
       echo "→ auto mode: classifier is the model itself; pinning both to '$PROVIDER'" >&2
     fi
   elif [[ -n "$PROVIDER" ]]; then
-    PIN_EXTRA="$(python3 -I -c '
-import json, sys, urllib.request
+    PIN_EXTRA="$(python3 -I -c "$(or_endpoints_py)"$'\n''
 main_model, cls_model, pin, pref, key = sys.argv[1:6]
-def endpoints(model):
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/models/" + model + "/endpoints",
-        headers={"Authorization": "Bearer " + key})
-    with urllib.request.urlopen(req, timeout=3) as r:
-        return json.load(r)["data"]["endpoints"]
-# As OpenRouter matches `only`: a slug selects its exact tag, every variant
-# under it ("z-ai" selects "z-ai/fp4"), or the display name.
-def matches(slug, e):
-    tag = e.get("tag") or ""
-    return slug in (tag, e.get("provider_name")) or tag.startswith(slug + "/")
-def serves(slug, eps):
-    return any(matches(slug, e) for e in eps)
 try:
-    main, cls = endpoints(main_model), endpoints(cls_model)
+    main, cls = endpoints(main_model, key), endpoints(cls_model, key)
 except Exception:
     raise SystemExit
 if pin and serves(pin, cls):
@@ -685,55 +1041,53 @@ elif [[ -n "$PROVIDER" && "$CLASSIFIER_MODEL" != "$MODEL" ]]; then
 fi
 
 
-if [[ -z "$PROVIDER" && -n "${CLAUDE_CODE_EXTRA_BODY:-}" ]]; then
-  CLAUDE_CODE_EXTRA_BODY="$(python3 -I -c '
-import json, sys
-try:
-    body = json.loads(sys.argv[1])
-except ValueError:
-    print(sys.argv[1]); raise SystemExit
-if isinstance(body, dict) and body.pop("provider", None) is not None:
-    print(json.dumps(body))
-else:
-    print(sys.argv[1])' "$CLAUDE_CODE_EXTRA_BODY")"
-  [[ "$CLAUDE_CODE_EXTRA_BODY" == "{}" ]] && unset CLAUDE_CODE_EXTRA_BODY
-  export CLAUDE_CODE_EXTRA_BODY
-fi
-
-# OpenRouter's Anthropic endpoint has no header/query way to choose a provider, so
-# merge provider preferences into the request body. Respect an EXTRA_BODY the user
-# already set by splicing both objects together instead of overwriting.
+# ---- CLAUDE_CODE_EXTRA_BODY: provider preferences and reasoning effort ----
+# OpenRouter's Anthropic endpoint has no header/query way to choose a provider,
+# so provider preferences (and reasoning.effort) go into the request body. A
+# body the user already set is spliced, never overwritten. Without a pin, a
+# `provider` key already in it is removed, so a pin left in the environment (by
+# a parent claude-or run, say) can't apply to an unpinned model. All JSON is
+# built in Python: the values come from the command line. A body that isn't a
+# JSON object stops the launch when something must be merged into it; before,
+# the failed merge left the variable empty and the pin silently disappeared.
+PREF_MODE=""
+PREF_PROVIDERS=()
 if [[ -n "$PROVIDER" ]]; then
-  ONLY_JSON="\"$PROVIDER\""
+  PREF_MODE=only; PREF_PROVIDERS=("$PROVIDER")
   # Second entry, if any, only ever matches the classifier model (see above).
-  [[ -n "$PIN_EXTRA" && "$PIN_EXTRA" != "$PROVIDER" ]] && ONLY_JSON="$ONLY_JSON,\"$PIN_EXTRA\""
-  PREFS="{\"only\":[$ONLY_JSON],\"allow_fallbacks\":false}"
+  [[ -n "$PIN_EXTRA" && "$PIN_EXTRA" != "$PROVIDER" ]] && PREF_PROVIDERS+=("$PIN_EXTRA")
 elif [[ -n "$ORDER_PROVIDER" ]]; then
-  PREFS="{\"order\":[\"$ORDER_PROVIDER\"],\"allow_fallbacks\":true}"
+  PREF_MODE=order; PREF_PROVIDERS=("$ORDER_PROVIDER")
 fi
-if [[ -n "$PROVIDER" || -n "$ORDER_PROVIDER" ]]; then
-  if [[ -n "${CLAUDE_CODE_EXTRA_BODY:-}" ]]; then
-    export CLAUDE_CODE_EXTRA_BODY="$(python3 -I -c '
+if [[ -n "${CLAUDE_CODE_EXTRA_BODY:-}" || -n "$PREF_MODE" || -n "$effort" ]]; then
+  if ! BODY="$(python3 -I -c '
 import json, sys
-base, prefs = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-base["provider"] = {**base.get("provider", {}), **prefs}
-print(json.dumps(base))' "$CLAUDE_CODE_EXTRA_BODY" "$PREFS")"
-  else
-    export CLAUDE_CODE_EXTRA_BODY="{\"provider\":$PREFS}"
+raw, mode, effort, providers = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+body = {}
+if raw:
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        if mode or effort:
+            sys.exit("CLAUDE_CODE_EXTRA_BODY is not a JSON object, so the %s cannot be added "
+                     "to it; fix or unset it" % ("provider pin" if mode else "reasoning effort"))
+        print(raw); raise SystemExit
+prov = body.pop("provider", None)
+if mode == "only":
+    body["provider"] = {**(prov if isinstance(prov, dict) else {}),
+                        "only": providers, "allow_fallbacks": False}
+elif mode == "order":
+    body["provider"] = {"order": providers, "allow_fallbacks": True}
+if effort:
+    r = body.get("reasoning")
+    body["reasoning"] = {**(r if isinstance(r, dict) else {}), "effort": effort}
+print(json.dumps(body) if body else "")' "${CLAUDE_CODE_EXTRA_BODY:-}" "$PREF_MODE" "$effort" \
+      ${PREF_PROVIDERS[@]+"${PREF_PROVIDERS[@]}"})"; then
+    exit 1
   fi
-fi
-
-# Merge reasoning effort in, keeping whatever body the user or the pin built.
-if [[ -n "$effort" ]]; then
-  if [[ -n "${CLAUDE_CODE_EXTRA_BODY:-}" ]]; then
-    export CLAUDE_CODE_EXTRA_BODY="$(python3 -I -c '
-import json, sys
-base, effort = json.loads(sys.argv[1]), sys.argv[2]
-base["reasoning"] = {**base.get("reasoning", {}), "effort": effort}
-print(json.dumps(base))' "$CLAUDE_CODE_EXTRA_BODY" "$effort")"
-  else
-    export CLAUDE_CODE_EXTRA_BODY="$(printf '{"reasoning":{"effort":"%s"}}' "$effort")"
-  fi
+  if [[ -n "$BODY" ]]; then export CLAUDE_CODE_EXTRA_BODY="$BODY"; else unset CLAUDE_CODE_EXTRA_BODY; fi
 fi
 
 # ---- appended system prompt ----
@@ -801,7 +1155,6 @@ TOKEN_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"   # Codex CLI's OAuth client
 AUTH_FILE = os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "auth.json")
 SECRET = os.environ.pop("CLAUDE_OR_PROXY_SECRET", "")
-PARENT = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 DEBUG = os.environ.get("CLAUDE_OR_PROXY_LOG", "")
 SIG_PREFIX = "cor1:"   # thinking-block signature carrying the Responses reasoning item
 lock = threading.Lock()
@@ -850,6 +1203,23 @@ def record(sid, usage):
             with open(tmp, "w") as f:
                 json.dump(st, f)
             os.replace(tmp, path)
+        except OSError:
+            pass
+
+
+def prune_sessions(days=30):
+    # One small file (two on ChatGPT) per session, forever, otherwise. A session
+    # resumed after this long starts its status-line total from zero.
+    cutoff = time.time() - days * 86400
+    try:
+        names = os.listdir(SESS_DIR)
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(SESS_DIR, n)
+        try:
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
         except OSError:
             pass
 
@@ -1335,24 +1705,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             resp.close()
 
 
-def watch_parent():
+def watch_parent(parent):
     while True:
         time.sleep(2)
         try:
-            os.kill(PARENT, 0)
+            os.kill(parent, 0)
         except ProcessLookupError:
             os._exit(0)
         except PermissionError:
             pass
 
 
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-srv.daemon_threads = True
-if PARENT:
-    threading.Thread(target=watch_parent, daemon=True).start()
-print(srv.server_address[1], flush=True)
-sys.stdout.close()
-srv.serve_forever()
+def main():
+    parent = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    if parent:
+        threading.Thread(target=watch_parent, args=(parent,), daemon=True).start()
+    print(srv.server_address[1], flush=True)
+    sys.stdout.close()
+    prune_sessions()
+    srv.serve_forever()
+
+
+if __name__ == "__main__":   # tests/ imports this code without starting a server
+    main()
 PY
 }
 
@@ -1367,20 +1744,12 @@ for a in ${ARGS[@]+"${ARGS[@]}"}; do
   case "$a" in --settings|--settings=*) STATUSLINE=0 ;; esac
 done
 SL_SETTINGS=""
-if (( STATUSLINE )); then
+if (( STATUSLINE )) && [[ -z "$(user_statusline_file)" ]]; then
   SL_SETTINGS="$(python3 -I -c '
-import json, os, shlex, sys
-self_path, backend = sys.argv[1:3]
-for f in (os.path.expanduser("~/.claude/settings.json"), ".claude/settings.json",
-          ".claude/settings.local.json"):
-    try:
-        if json.load(open(f)).get("statusLine"):
-            raise SystemExit
-    except (OSError, ValueError, AttributeError):
-        pass
-cmd = "%s --statusline %s" % (shlex.quote(self_path), backend)
+import json, shlex, sys
+cmd = "%s --statusline %s" % (shlex.quote(sys.argv[1]), sys.argv[2])
 print(json.dumps({"statusLine": {"type": "command", "command": cmd, "refreshInterval": 30}}))' \
-    "$(readlink -f "${BASH_SOURCE[0]}")" "$BACKEND" 2>/dev/null || true)"
+    "$SELF" "$BACKEND" 2>/dev/null || true)"
 fi
 
 # ---- start the local proxy ----
@@ -1427,7 +1796,7 @@ fi
 [[ -n "$SL_SETTINGS" ]] && set -- --settings "$SL_SETTINGS" "$@"
 
 if [[ -z "${CLAUDE_OR_NO_VERSION_CHECK:-}" ]]; then
-  CC_VERSION="$(claude --version 2>/dev/null | awk '{print $1}')" || CC_VERSION=""
+  CC_VERSION="$(cc_version)"
   if [[ -n "$CC_VERSION" && "$CC_VERSION" != "$TESTED_CC_VERSION" \
         && "$(printf '%s\n%s\n' "$TESTED_CC_VERSION" "$CC_VERSION" | sort -V | tail -1)" == "$CC_VERSION" ]]; then
     echo "→ note: Claude Code $CC_VERSION is newer than tested $TESTED_CC_VERSION; check changelog (see TESTED_CC_VERSION in $0)" >&2
@@ -1439,8 +1808,8 @@ echo "→ Claude Code via $VIA, model: $MODEL_ID${PROVIDER:+ (provider: $PROVIDE
 if (( AUTO_MODE )); then
   echo "→ auto permission mode; classifier: $CLAUDE_CODE_AUTO_MODE_MODEL" >&2
   (( AUTO_FLAG )) || set -- --permission-mode auto "$@"
-  exec claude "${PLUGIN_ARGS[@]}" "$@"
+  exec claude ${PLUGIN_ARGS[@]+"${PLUGIN_ARGS[@]}"} "$@"
 elif (( FORCE_SKIP )); then
-  exec claude "${PLUGIN_ARGS[@]}" --dangerously-skip-permissions "$@"
+  exec claude ${PLUGIN_ARGS[@]+"${PLUGIN_ARGS[@]}"} --dangerously-skip-permissions "$@"
 fi
-exec claude "${PLUGIN_ARGS[@]}" "$@"
+exec claude ${PLUGIN_ARGS[@]+"${PLUGIN_ARGS[@]}"} "$@"
