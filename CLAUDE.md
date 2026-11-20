@@ -3,7 +3,8 @@
 ## Project
 
 `claude-or` is a single Bash wrapper (`./claude-or`) that launches Claude Code against
-OpenRouter's Anthropic-compatible endpoint so any OpenRouter model can drive it. It
+OpenRouter's Anthropic-compatible endpoint so any OpenRouter model can drive it, or
+against a ChatGPT subscription (Codex backend) through an embedded local proxy. It
 sets env vars, builds `CLAUDE_CODE_EXTRA_BODY`, then `exec`s `claude`. No build step,
 no dependencies beyond `bash`, `python3` (stdlib only, inline `-I -c` snippets),
 `md5sum`, `find`, and `claude` itself.
@@ -26,9 +27,14 @@ no dependencies beyond `bash`, `python3` (stdlib only, inline `-I -c` snippets),
    (not `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, which kills session titles).
 6. Rebuild `.skills-plugin/` when the synced skills manifest hash changes.
 7. Auto mode: `CLAUDE_CODE_AUTO_MODE_SERVER=0` + local classifier model; reconcile provider
-   pin so the classifier request is not refused.
+   pin so the classifier request is not refused. ChatGPT mode uses `gpt-6-luna`, no pins.
 8. Merge provider prefs and reasoning effort into `CLAUDE_CODE_EXTRA_BODY` (splice, never overwrite user JSON).
-9. Append system prompt unless the caller passed their own; version check; `exec claude`.
+9. Append system prompt unless the caller passed their own.
+10. ChatGPT backend (`chatgpt:<slug>` models): start the embedded stdlib proxy
+    (`chatgpt_proxy_py`, Anthropic Messages → Codex Responses, auth from
+    `~/.codex/auth.json`) and point `ANTHROPIC_BASE_URL` at it. It must write
+    refreshed tokens back to `auth.json`, or Codex gets logged out.
+11. Version check; `exec claude` (the proxy exits when that PID does).
 
 ## Conventions
 - Keep it one file. Keep `set -euo pipefail` safe: guard optional vars with `${VAR:-}`

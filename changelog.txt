@@ -8,6 +8,16 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
+Added
+- ChatGPT subscription backend: `chatgpt` and `chatgpt-mini` aliases and any
+  `chatgpt:<slug>` model run on your ChatGPT plan through the Codex login,
+  via a built-in local proxy. No OpenRouter key needed for these.
+- Auto mode in ChatGPT mode uses gpt-6-luna as its safety classifier, on the
+  same subscription.
+- CLAUDE_OR_PROXY_LOG to log ChatGPT proxy requests and errors.
+
+Changed
+- OPENROUTER_API_KEY is only required for OpenRouter models.
 
 
 [1.1.0] - 2026-11-21

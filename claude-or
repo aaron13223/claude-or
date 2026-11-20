@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Launch Claude Code against OpenRouter with any model (GPT, Grok, Gemini, ...).
+# Launch Claude Code against OpenRouter with any model (GPT, Grok, Gemini, ...),
+# or against your ChatGPT subscription.
 #
 # Usage:
 #   ./claude-or                     # interactive model picker
@@ -8,16 +9,26 @@
 #   ./claude-or deepseek@stepfun    # force a specific OpenRouter provider for one run
 #   ./claude-or deepseek            # deepseek runs at reasoning effort "max" (see EFFORT below)
 #   ./claude-or deepseek --no-auto  # bypass every permission prompt (the old default)
+#   ./claude-or chatgpt             # ChatGPT subscription (gpt-6-sol), no OpenRouter billing
 #   ./claude-or --list              # show aliases
 #   ./claude-or --version           # print wrapper version
 #
-# Reads OPENROUTER_API_KEY from .env next to this script.
+# Reads OPENROUTER_API_KEY from .env next to this script (OpenRouter models only).
+#
+# ChatGPT subscription: `./claude-or chatgpt` (or any `chatgpt:<slug>`, e.g.
+# chatgpt:gpt-6-luna) bills your ChatGPT plan instead of OpenRouter. It reuses
+# the Codex CLI login in ~/.codex/auth.json (or $CODEX_HOME), so run `codex
+# login` once; no OpenRouter key is needed. A local proxy, started per run and
+# stopped with Claude Code, translates Anthropic Messages to the Codex Responses
+# backend. CLAUDE_OR_PROXY_LOG=<file> logs its requests. See CHATGPT SUBSCRIPTION
+# below.
 #
 # Auto mode is the default: it runs Claude Code's own safety classifier, pointed
 # at anthropic/claude-haiku-5.5. Override with CLAUDE_OR_CLASSIFIER_MODEL (and
 # CLAUDE_OR_CLASSIFIER_PROVIDER if you want the classifier on a specific
-# provider). See AUTO MODE below for why the stock server-side check cannot
-# work through OpenRouter.
+# provider). In ChatGPT mode the classifier is gpt-6-luna on the same
+# subscription (CLAUDE_OR_CLASSIFIER_MODEL takes a ChatGPT slug there). See AUTO
+# MODE below for why the stock server-side check cannot work through OpenRouter.
 #
 # System prompt: system-prompt.md next to this script is appended to Claude
 # Code's own system prompt on every run (edit it to set a house style). Override
@@ -60,6 +71,8 @@ fi
 #     firstParty gate, ~/.claude/plugins/synced, --plugin-dir, plugin.json schema
 #   - session title gating on nonessential traffic
 #   - flags: --append-system-prompt, --dangerously-skip-permissions
+#   - ChatGPT proxy: the Messages request shape it translates (role "system"
+#     messages, thinking signatures echoed back, output_config.effort, tool_choice)
 TESTED_CC_VERSION="2.1.329"
 
 DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -79,8 +92,13 @@ declare -A MODELS=(
   [kimi]="moonshotai/kimi-k3.1-pro"
   [glm]="z-ai/glm-5.3-flash"
   [claude]="anthropic/claude-sonnet-5.5"
+  # `chatgpt:` = ChatGPT subscription via the local proxy, not OpenRouter. Slugs
+  # come from ~/.codex/models_cache.json. gpt-6-astra answered "no healthy
+  # upstream" when tested on 2026-11-21, so the alias uses gpt-6-sol.
+  [chatgpt]="chatgpt:gpt-6-sol"
+  [chatgpt-mini]="chatgpt:gpt-6-luna"
 )
-ORDER=(gpt gpt-mini grok gemini gemini-flash deepseek qwen kimi glm claude)
+ORDER=(gpt gpt-mini grok gemini gemini-flash deepseek qwen kimi glm claude chatgpt chatgpt-mini)
 
 list() {
   printf '%-14s %s\n' ALIAS MODEL
@@ -91,7 +109,6 @@ list() {
 if [[ -f "$DIR/.env" ]]; then
   set -a; . "$DIR/.env"; set +a
 fi
-: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY missing (put it in $DIR/.env)}"
 
 # ---- pick model ----
 choice="${1:-}"
@@ -123,8 +140,17 @@ if [[ "$MODEL" == *@* ]]; then
   MODEL="${MODEL%@*}"
 fi
 
-if [[ "$MODEL" != */* ]]; then
+BACKEND=openrouter
+if [[ "$MODEL" == chatgpt:?* ]]; then
+  BACKEND=chatgpt
+  if [[ -n "$PROVIDER" ]]; then
+    echo "@provider pins are OpenRouter-only; '$choice' runs on your ChatGPT subscription" >&2; exit 1
+  fi
+elif [[ "$MODEL" != */* ]]; then
   echo "Unknown alias '$choice'. Run: $0 --list" >&2; exit 1
+fi
+if [[ "$BACKEND" == openrouter ]]; then
+  : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY missing (put it in $DIR/.env)}"
 fi
 
 # ---- permission mode ----
@@ -189,6 +215,8 @@ declare -A CONTEXT=(
   [kimi]=1048576
   [glm]=262000           # tenstorrent/fp8; most providers serve 262,144
   [claude]=1000000
+  [chatgpt]=272000       # context_window in ~/.codex/models_cache.json
+  [chatgpt-mini]=272000
 )
 # ---- output token cap (per alias) ----
 # Since 2.1.329 Claude Code no longer retries at the limit a `max_tokens` error
@@ -212,6 +240,21 @@ ALIAS_PIN=""
 if [[ -n "${CONTEXT[$choice]:-}" && "$PROVIDER" == "$ALIAS_PIN" ]]; then
   [[ -z "$CTX" ]] && CTX="${CONTEXT[$choice]}"
   [[ -z "$OUT" ]] && OUT="${MAXOUT[$choice]:-}"
+elif [[ "$BACKEND" == chatgpt ]]; then
+  # The Codex backend takes no output cap (the proxy drops max_tokens), so only
+  # the window matters; Codex caches it per model, no network needed.
+  if [[ -z "$CTX" ]]; then
+    CTX="$(python3 -I -c '
+import json, os, sys
+home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+try:
+    models = json.load(open(os.path.join(home, "models_cache.json")))["models"]
+except Exception:
+    raise SystemExit
+print(next((m["context_window"] for m in models
+            if m.get("slug") == sys.argv[1] and m.get("context_window")), ""))' "${MODEL#chatgpt:}" 2>/dev/null || true)"
+    [[ -z "$CTX" ]] && echo "→ note: ${MODEL#chatgpt:} not in Codex's model cache; Claude Code will assume a context window" >&2
+  fi
 elif [[ -z "$CTX" || -z "$OUT" ]]; then
   {
     # Pinned: that provider's limits. Unpinned: the smallest any provider serves,
@@ -249,15 +292,20 @@ else
 fi
 
 # ---- point Claude Code at OpenRouter's Anthropic-compatible endpoint ----
-export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
-export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
+# (ChatGPT mode sets the base URL and token once its proxy is up, just before
+# launch; the bare slug is the model name Claude Code shows.)
+MODEL_ID="${MODEL#chatgpt:}"
+if [[ "$BACKEND" == openrouter ]]; then
+  export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
+  export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
+fi
 export ANTHROPIC_API_KEY=""   # must be explicitly empty so it isn't used
-export ANTHROPIC_MODEL="$MODEL"
-export ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
-export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL"
+export ANTHROPIC_MODEL="$MODEL_ID"
+export ANTHROPIC_SMALL_FAST_MODEL="$MODEL_ID"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_ID"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_ID"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_ID"
+export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL_ID"
 
 # ---- keep Claude Code quiet without switching off terminal titles ----
 # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC puts Claude Code in "essential
@@ -349,8 +397,20 @@ fi
 # The classifier is anthropic/claude-haiku-5.5. Its provider is left to
 # OpenRouter (no preference is sent); set CLAUDE_OR_CLASSIFIER_PROVIDER to
 # force one.
-CLASSIFIER_MODEL="${CLAUDE_OR_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}"
-CLASSIFIER_PROVIDER="${CLAUDE_OR_CLASSIFIER_PROVIDER:-}"
+# In ChatGPT mode every request goes to the proxy, so the classifier must be a
+# ChatGPT model too: gpt-6-luna by default, and CLAUDE_OR_CLASSIFIER_MODEL takes
+# a bare or `chatgpt:` slug (an OpenRouter ID there is an error).
+if [[ "$BACKEND" == chatgpt ]]; then
+  CLASSIFIER_MODEL="${CLAUDE_OR_CLASSIFIER_MODEL:-gpt-6-luna}"
+  CLASSIFIER_MODEL="${CLASSIFIER_MODEL#chatgpt:}"
+  if [[ "$CLASSIFIER_MODEL" == */* ]]; then
+    echo "CLAUDE_OR_CLASSIFIER_MODEL=$CLASSIFIER_MODEL is an OpenRouter ID; ChatGPT mode needs a ChatGPT slug (e.g. gpt-6-luna)" >&2; exit 1
+  fi
+  CLASSIFIER_PROVIDER=""   # no pins here, so the reconciliation below is a no-op
+else
+  CLASSIFIER_MODEL="${CLAUDE_OR_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}"
+  CLASSIFIER_PROVIDER="${CLAUDE_OR_CLASSIFIER_PROVIDER:-}"
+fi
 export CLAUDE_CODE_AUTO_MODE_SERVER=0
 export CLAUDE_CODE_AUTO_MODE_MODEL="$CLASSIFIER_MODEL"
 
@@ -508,6 +568,466 @@ if (( ! PROMPT_SKIP )); then
 fi
 [[ -n "$PROMPT_TEXT" ]] && set -- --append-system-prompt "$PROMPT_TEXT" "$@"
 
+# ---- ChatGPT subscription (local proxy) ----
+# Claude Code only speaks Anthropic Messages; a ChatGPT plan is only reachable
+# through the Codex backend (chatgpt.com/backend-api/codex/responses), which
+# speaks the OpenAI Responses API with the Codex CLI's OAuth tokens. So ChatGPT
+# mode starts the stdlib proxy below on a random 127.0.0.1 port and points
+# ANTHROPIC_BASE_URL at it. Notes (Codex CLI 0.155, tested 2026-11-21):
+#   - Auth is shared with Codex. Refresh tokens rotate on use, so the proxy
+#     writes refreshed tokens back to auth.json (atomic replace); keeping its own
+#     copy would log Codex out on its next refresh.
+#   - The backend rejects max_tokens/temperature, wants store=false and a stream,
+#     and accepts our own `instructions` (Claude Code's system prompt).
+#   - GPT reasoning survives across turns: the encrypted reasoning item rides in
+#     the thinking block's signature (prefix "cor1:"), which Claude Code sends back.
+#   - Anthropic server tools (WebSearch's web_search_*) have no mapping and are
+#     dropped; count_tokens is a bytes/4 estimate.
+# The proxy accepts only a per-run random token (ANTHROPIC_AUTH_TOKEN) and exits
+# within 2s of this PID going away; exec keeps the PID, so that is Claude Code's.
+chatgpt_proxy_py() {
+  cat <<'PY'
+import base64, fcntl, http.server, json, os, sys, threading, time, urllib.error, urllib.request, uuid
+
+UPSTREAM = "https://chatgpt.com/backend-api/codex/responses"
+TOKEN_URL = "https://auth.openai.com/oauth/token"
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"   # Codex CLI's OAuth client
+AUTH_FILE = os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "auth.json")
+SECRET = os.environ.pop("CLAUDE_OR_PROXY_SECRET", "")
+PARENT = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+DEBUG = os.environ.get("CLAUDE_OR_PROXY_LOG", "")
+SIG_PREFIX = "cor1:"   # thinking-block signature carrying the Responses reasoning item
+lock = threading.Lock()
+
+
+def log(*a):
+    if DEBUG:
+        with open(DEBUG, "a") as f:
+            print(time.strftime("%H:%M:%S"), *a, file=f)
+
+
+# ---------- auth (shared with Codex: refresh tokens rotate, so write back) ----------
+def jwt_exp(tok):
+    try:
+        p = tok.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4))).get("exp", 0)
+    except Exception:
+        return 0
+
+
+def read_auth():
+    with open(AUTH_FILE) as f:
+        return json.load(f)
+
+
+def refresh(stale_access):
+    with lock, open(AUTH_FILE + ".claude-or.lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        auth = read_auth()
+        tok = auth.get("tokens") or {}
+        if tok.get("access_token") != stale_access and jwt_exp(tok.get("access_token", "")) > time.time() + 60:
+            return auth   # someone (Codex, another claude-or) already refreshed
+        body = json.dumps({"client_id": CLIENT_ID, "grant_type": "refresh_token",
+                           "refresh_token": tok.get("refresh_token", ""),
+                           "scope": "openid profile email"}).encode()
+        req = urllib.request.Request(TOKEN_URL, body, {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            new = json.load(r)
+        for k in ("id_token", "access_token", "refresh_token"):
+            if new.get(k):
+                tok[k] = new[k]
+        auth["tokens"] = tok
+        auth["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        tmp = AUTH_FILE + ".claude-or.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(auth, f, indent=2)
+        os.replace(tmp, AUTH_FILE)
+        log("refreshed token")
+        return auth
+
+
+def credentials(force=False):
+    auth = read_auth()
+    tok = auth.get("tokens") or {}
+    if force or jwt_exp(tok.get("access_token", "")) < time.time() + 60:
+        auth = refresh(tok.get("access_token"))
+        tok = auth["tokens"]
+    return tok["access_token"], tok.get("account_id", "")
+
+
+# ---------- Anthropic Messages -> Responses ----------
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text", "") for b in content or [] if b.get("type") == "text")
+
+
+def image_part(b):
+    src = b.get("source") or {}
+    if src.get("type") == "base64":
+        return {"type": "input_image", "image_url": "data:%s;base64,%s" % (src.get("media_type"), src.get("data"))}
+    if src.get("type") == "url":
+        return {"type": "input_image", "image_url": src.get("url")}
+    return None
+
+
+def convert_input(messages):
+    items = []
+    for m in messages:
+        role, content = m.get("role"), m.get("content")
+        if role == "system":
+            role = "developer"   # mid-conversation system turns (CC 2.1.329); the backend refuses "system"
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        parts = []
+
+        def flush():
+            if parts:
+                items.append({"type": "message", "role": role, "content": list(parts)})
+                parts.clear()
+
+        for b in content or []:
+            t = b.get("type")
+            if t == "text":
+                if b.get("text"):
+                    parts.append({"type": "output_text" if role == "assistant" else "input_text", "text": b["text"]})
+            elif t == "image" and role == "user":
+                p = image_part(b)
+                if p:
+                    parts.append(p)
+            elif t == "tool_result":
+                flush()
+                c = b.get("content")
+                out = c if isinstance(c, str) else text_of(c)
+                if b.get("is_error"):
+                    out = "[tool error] " + out
+                items.append({"type": "function_call_output", "call_id": b.get("tool_use_id"), "output": out or ""})
+                imgs = [image_part(x) for x in (c if isinstance(c, list) else []) if x.get("type") == "image"]
+                imgs = [i for i in imgs if i]
+                if imgs:
+                    items.append({"type": "message", "role": "user", "content": imgs})
+            elif t == "tool_use":
+                flush()
+                items.append({"type": "function_call", "call_id": b.get("id"), "name": b.get("name"),
+                              "arguments": json.dumps(b.get("input") or {})})
+            elif t == "thinking" and role == "assistant":
+                sig = b.get("signature") or ""
+                if sig.startswith(SIG_PREFIX):
+                    flush()
+                    try:
+                        enc = base64.b64decode(sig[len(SIG_PREFIX):]).decode()
+                    except Exception:
+                        continue
+                    summary = [{"type": "summary_text", "text": b["thinking"]}] if b.get("thinking") else []
+                    items.append({"type": "reasoning", "summary": summary, "encrypted_content": enc})
+        flush()
+    return items
+
+
+def convert_tools(tools):
+    out = []
+    for t in tools or []:
+        if t.get("type") not in (None, "custom"):
+            continue   # Anthropic server tools (web_search_*, ...) have no equivalent here
+        out.append({"type": "function", "name": t["name"], "description": t.get("description", ""),
+                    "parameters": t.get("input_schema") or {"type": "object", "properties": {}}, "strict": False})
+    return out
+
+
+def convert_tool_choice(tc):
+    if not tc:
+        return "auto"
+    return {"auto": "auto", "any": "required", "none": "none"}.get(tc.get("type")) or \
+        {"type": "function", "name": tc.get("name")}
+
+
+def build_request(body):
+    model = body.get("model", "")
+    model = model.split(":", 1)[1] if model.startswith("chatgpt:") else model
+    # reasoning.effort is what claude-or puts in CLAUDE_CODE_EXTRA_BODY; output_config
+    # is Claude Code's own effort field. Neither set: the model's default.
+    effort = (body.get("reasoning") or {}).get("effort") or (body.get("output_config") or {}).get("effort")
+    sysp = body.get("system")
+    req = {
+        "model": model,
+        "instructions": text_of(sysp) if sysp else "",
+        "input": convert_input(body.get("messages") or []),
+        "tools": convert_tools(body.get("tools")),
+        "tool_choice": convert_tool_choice(body.get("tool_choice")),
+        "parallel_tool_calls": not (body.get("tool_choice") or {}).get("disable_parallel_tool_use"),
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        "reasoning": {"summary": "auto", **({"effort": effort} if effort else {})},
+    }
+    uid = (body.get("metadata") or {}).get("user_id")
+    if uid:
+        req["prompt_cache_key"] = str(uuid.uuid5(uuid.NAMESPACE_URL, uid))
+    return req
+
+
+# ---------- Responses SSE -> Anthropic events ----------
+def sse_events(resp):
+    data = []
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip())
+        elif not line and data:
+            try:
+                yield json.loads("\n".join(data))
+            except ValueError:
+                pass
+            data = []
+
+
+def translate(resp, model):
+    msg_id = "msg_" + uuid.uuid4().hex[:24]
+    yield "message_start", {"type": "message_start", "message": {
+        "id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [],
+        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}}
+    idx = -1
+    open_kind = None   # (output_index, kind)
+    got_args = False
+    saw_tool = False
+
+    def close():
+        nonlocal open_kind
+        if open_kind:
+            open_kind = None
+            return [("content_block_stop", {"type": "content_block_stop", "index": idx})]
+        return []
+
+    for ev in sse_events(resp):
+        t = ev.get("type", "")
+        if t == "response.output_item.added":
+            item = ev.get("item") or {}
+            it = item.get("type")
+            for e in close():
+                yield e
+            if it == "reasoning":
+                idx += 1; open_kind = "thinking"
+                yield "content_block_start", {"type": "content_block_start", "index": idx,
+                                              "content_block": {"type": "thinking", "thinking": "", "signature": ""}}
+            elif it == "message":
+                idx += 1; open_kind = "text"
+                yield "content_block_start", {"type": "content_block_start", "index": idx,
+                                              "content_block": {"type": "text", "text": ""}}
+            elif it == "function_call":
+                idx += 1; open_kind = "tool"; got_args = False; saw_tool = True
+                yield "content_block_start", {"type": "content_block_start", "index": idx, "content_block": {
+                    "type": "tool_use", "id": item.get("call_id"), "name": item.get("name"), "input": {}}}
+        elif t == "response.output_text.delta" and open_kind == "text":
+            yield "content_block_delta", {"type": "content_block_delta", "index": idx,
+                                          "delta": {"type": "text_delta", "text": ev.get("delta", "")}}
+        elif t == "response.reasoning_summary_text.delta" and open_kind == "thinking":
+            yield "content_block_delta", {"type": "content_block_delta", "index": idx,
+                                          "delta": {"type": "thinking_delta", "thinking": ev.get("delta", "")}}
+        elif t == "response.reasoning_summary_part.added" and open_kind == "thinking" and ev.get("summary_index"):
+            yield "content_block_delta", {"type": "content_block_delta", "index": idx,
+                                          "delta": {"type": "thinking_delta", "thinking": "\n\n"}}
+        elif t == "response.function_call_arguments.delta" and open_kind == "tool":
+            got_args = True
+            yield "content_block_delta", {"type": "content_block_delta", "index": idx,
+                                          "delta": {"type": "input_json_delta", "partial_json": ev.get("delta", "")}}
+        elif t == "response.output_item.done":
+            item = ev.get("item") or {}
+            if open_kind == "thinking" and item.get("type") == "reasoning":
+                sig = SIG_PREFIX + base64.b64encode((item.get("encrypted_content") or "").encode()).decode()
+                yield "content_block_delta", {"type": "content_block_delta", "index": idx,
+                                              "delta": {"type": "signature_delta", "signature": sig}}
+            elif open_kind == "tool" and not got_args and item.get("arguments"):
+                yield "content_block_delta", {"type": "content_block_delta", "index": idx,
+                                              "delta": {"type": "input_json_delta", "partial_json": item["arguments"]}}
+            for e in close():
+                yield e
+        elif t in ("response.completed", "response.incomplete"):
+            for e in close():
+                yield e
+            r = ev.get("response") or {}
+            u = r.get("usage") or {}
+            cached = (u.get("input_tokens_details") or {}).get("cached_tokens", 0) or 0
+            reason = "tool_use" if saw_tool else "end_turn"
+            if t == "response.incomplete" and (r.get("incomplete_details") or {}).get("reason") == "max_output_tokens":
+                reason = "max_tokens"
+            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": None},
+                                    "usage": {"input_tokens": max(0, (u.get("input_tokens") or 0) - cached),
+                                              "cache_read_input_tokens": cached,
+                                              "output_tokens": u.get("output_tokens") or 0}}
+            yield "message_stop", {"type": "message_stop"}
+            return
+        elif t in ("response.failed", "error"):
+            err = (ev.get("response") or {}).get("error") or ev.get("error") or ev
+            yield "error", {"type": "error", "error": {"type": "api_error", "message": err.get("message") or json.dumps(err)}}
+            return
+    yield "error", {"type": "error", "error": {"type": "api_error", "message": "ChatGPT stream ended early"}}
+
+
+def collect(events):
+    msg, blocks, partial = None, [], {}
+    for name, ev in events:
+        if name == "message_start":
+            msg = ev["message"]
+        elif name == "content_block_start":
+            blocks.append(dict(ev["content_block"]))
+        elif name == "content_block_delta":
+            b, d = blocks[ev["index"]], ev["delta"]
+            if d["type"] == "text_delta": b["text"] += d["text"]
+            elif d["type"] == "thinking_delta": b["thinking"] += d["thinking"]
+            elif d["type"] == "signature_delta": b["signature"] = d["signature"]
+            elif d["type"] == "input_json_delta": partial[ev["index"]] = partial.get(ev["index"], "") + d["partial_json"]
+        elif name == "message_delta":
+            msg.update(ev["delta"]); msg["usage"] = ev["usage"]
+        elif name == "error":
+            return None, ev
+    for i, s in partial.items():
+        try:
+            blocks[i]["input"] = json.loads(s) if s else {}
+        except ValueError:
+            blocks[i]["input"] = {}
+    msg["content"] = blocks
+    return msg, None
+
+
+# ---------- HTTP ----------
+ERR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+             404: "not_found_error", 429: "rate_limit_error", 529: "overloaded_error"}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def send_json(self, status, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_err(self, status, message):
+        self.send_json(status, {"type": "error", "error": {"type": ERR_TYPES.get(status, "api_error"), "message": message}})
+
+    def do_HEAD(self):
+        self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+
+    def do_GET(self):
+        self.send_json(200, {"ok": True})
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n)
+        if SECRET and self.headers.get("x-api-key") != SECRET and \
+                self.headers.get("Authorization") != "Bearer " + SECRET:
+            return self.send_err(401, "bad proxy token")
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return self.send_err(400, "invalid JSON")
+        path = self.path.split("?")[0]
+        if path.endswith("/count_tokens"):
+            return self.send_json(200, {"input_tokens": len(raw) // 4})
+        if not path.endswith("/v1/messages"):
+            return self.send_err(404, "not found: " + path)
+        req = build_request(body)
+        log("->", req["model"], "effort", req["reasoning"].get("effort"), "items", len(req["input"]), "tools", len(req["tools"]))
+        payload = json.dumps(req).encode()
+        resp = None
+        for attempt in (0, 1):
+            try:
+                access, account = credentials(force=attempt == 1)
+            except Exception as e:
+                return self.send_err(401, "ChatGPT login unusable (%s). Run `codex login` and retry." % e)
+            headers = {"Authorization": "Bearer " + access, "chatgpt-account-id": account,
+                       "OpenAI-Beta": "responses=experimental", "originator": "codex_cli_rs",
+                       "Content-Type": "application/json", "Accept": "text/event-stream",
+                       "session_id": req.get("prompt_cache_key") or str(uuid.uuid4())}
+            try:
+                resp = urllib.request.urlopen(urllib.request.Request(UPSTREAM, payload, headers), timeout=600)
+                break
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace")[:2000]
+                log("<- HTTP", e.code, detail)
+                if e.code == 401 and attempt == 0:
+                    continue
+                try:
+                    j = json.loads(detail)
+                    msg = (j.get("error") or {}).get("message") or j.get("detail") or detail
+                except ValueError:
+                    msg = detail
+                if not isinstance(msg, str):
+                    msg = json.dumps(msg)
+                # 5xx passes through so Claude Code's own retry kicks in.
+                status = e.code if e.code in ERR_TYPES or 500 <= e.code < 600 else 502
+                return self.send_err(status, "ChatGPT: " + msg)
+            except Exception as e:
+                return self.send_err(502, "ChatGPT unreachable: %s" % e)
+        model = body.get("model", "")
+        with resp:
+            events = translate(resp, model)
+            if not body.get("stream"):
+                msg, err = collect(events)
+                return self.send_json(200, msg) if msg else self.send_err(502, err["error"]["message"])
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                for name, ev in events:
+                    self.wfile.write(("event: %s\ndata: %s\n\n" % (name, json.dumps(ev))).encode())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+
+def watch_parent():
+    while True:
+        time.sleep(2)
+        try:
+            os.kill(PARENT, 0)
+        except ProcessLookupError:
+            os._exit(0)
+        except PermissionError:
+            pass
+
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+srv.daemon_threads = True
+if PARENT:
+    threading.Thread(target=watch_parent, daemon=True).start()
+print(srv.server_address[1], flush=True)
+sys.stdout.close()
+srv.serve_forever()
+PY
+}
+
+if [[ "$BACKEND" == chatgpt ]]; then
+  CODEX_AUTH="${CODEX_HOME:-$HOME/.codex}/auth.json"
+  if ! python3 -I -c '
+import json, sys
+tok = json.load(open(sys.argv[1])).get("tokens") or {}
+sys.exit(0 if tok.get("refresh_token") else 1)' "$CODEX_AUTH" 2>/dev/null; then
+    echo "No ChatGPT login in $CODEX_AUTH. Run: codex login" >&2; exit 1
+  fi
+  PROXY_SECRET="$(head -c 32 /dev/urandom | md5sum | cut -d' ' -f1)"
+  exec {PROXY_FD}< <(CLAUDE_OR_PROXY_SECRET="$PROXY_SECRET" exec python3 -I -c "$(chatgpt_proxy_py)" "$$" \
+                       </dev/null 2>>"${CLAUDE_OR_PROXY_LOG:-/dev/null}")
+  PROXY_PORT=""
+  read -r -t 10 -u "$PROXY_FD" PROXY_PORT || true
+  exec {PROXY_FD}<&-
+  if [[ ! "$PROXY_PORT" =~ ^[0-9]+$ ]]; then
+    echo "ChatGPT proxy failed to start (set CLAUDE_OR_PROXY_LOG=<file> to see why)" >&2; exit 1
+  fi
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
+  export ANTHROPIC_AUTH_TOKEN="$PROXY_SECRET"
+fi
+
 if [[ -z "${CLAUDE_OR_NO_VERSION_CHECK:-}" ]]; then
   CC_VERSION="$(claude --version 2>/dev/null | awk '{print $1}')" || CC_VERSION=""
   if [[ -n "$CC_VERSION" && "$CC_VERSION" != "$TESTED_CC_VERSION" \
@@ -516,7 +1036,8 @@ if [[ -z "${CLAUDE_OR_NO_VERSION_CHECK:-}" ]]; then
   fi
 fi
 
-echo "→ Claude Code via OpenRouter, model: $MODEL${PROVIDER:+ (provider: $PROVIDER, no fallback)}${effort:+ (reasoning effort: $effort)}${CTX:+ (context: $CTX)}${OUT:+ (max output: $OUT)}${PROMPT_TEXT:+ (custom system prompt)}" >&2
+VIA="OpenRouter"; [[ "$BACKEND" == chatgpt ]] && VIA="ChatGPT subscription"
+echo "→ Claude Code via $VIA, model: $MODEL_ID${PROVIDER:+ (provider: $PROVIDER, no fallback)}${effort:+ (reasoning effort: $effort)}${CTX:+ (context: $CTX)}${OUT:+ (max output: $OUT)}${PROMPT_TEXT:+ (custom system prompt)}" >&2
 if (( AUTO_MODE )); then
   echo "→ auto permission mode; classifier: $CLAUDE_CODE_AUTO_MODE_MODEL" >&2
   (( AUTO_FLAG )) || set -- --permission-mode auto "$@"
