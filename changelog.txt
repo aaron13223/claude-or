@@ -8,6 +8,10 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
+
+
+[1.2.0] - 2026-11-21
+--------------------
 Added
 - ChatGPT subscription backend: `chatgpt` and `chatgpt-mini` aliases and any
   `chatgpt:<slug>` model run on your ChatGPT plan through the Codex login,

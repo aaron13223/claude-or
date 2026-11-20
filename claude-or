@@ -49,7 +49,7 @@
 set -euo pipefail
 
 # ---- wrapper version (SemVer; must match the top entry in changelog.txt) ----
-CLAUDE_OR_VERSION="1.1.0"
+CLAUDE_OR_VERSION="1.2.0"
 if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
   echo "claude-or $CLAUDE_OR_VERSION"; exit 0
 fi
