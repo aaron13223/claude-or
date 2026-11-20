@@ -8,6 +8,10 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
+
+
+[1.5.0] - 2026-11-21
+--------------------
 Added
 - CLAUDE_OR_DEFAULT_MODEL: Enter at the model menu picks it, and a flag as the
   first argument (`./claude-or -p "hi"`, `./claude-or --no-auto`) runs it.
