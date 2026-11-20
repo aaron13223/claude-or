@@ -1,0 +1,13 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Generated at runtime by claude-or (machine-specific symlinks)
+.skills-plugin/
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/

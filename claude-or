@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# Launch Claude Code against OpenRouter with any model (GPT, Grok, Gemini, ...).
+#
+# Usage:
+#   ./claude-or                     # interactive model picker
+#   ./claude-or gpt                 # use an alias
+#   ./claude-or x-ai/grok-4.7 -p "hi" # any OpenRouter model ID; extra args go to claude
+#   ./claude-or deepseek@stepfun    # force a specific OpenRouter provider for one run
+#   ./claude-or deepseek            # deepseek runs at reasoning effort "max" (see EFFORT below)
+#   ./claude-or deepseek --no-auto  # bypass every permission prompt (the old default)
+#   ./claude-or --list              # show aliases
+#
+# Reads OPENROUTER_API_KEY from .env next to this script.
+#
+# Auto mode is the default: it runs Claude Code's own safety classifier, pointed
+# at anthropic/claude-haiku-5.5. Override with CLAUDE_OR_CLASSIFIER_MODEL (and
+# CLAUDE_OR_CLASSIFIER_PROVIDER if you want the classifier on a specific
+# provider). See AUTO MODE below for why the stock server-side check cannot
+# work through OpenRouter.
+#
+# System prompt: system-prompt.md next to this script is appended to Claude
+# Code's own system prompt on every run (edit it to set a house style). Override
+# with CLAUDE_OR_SYSTEM_PROMPT (literal text) or CLAUDE_OR_SYSTEM_PROMPT_FILE (a
+# path); CLAUDE_OR_SYSTEM_PROMPT=0 turns the append off. See APPENDED SYSTEM
+# PROMPT below.
+#
+# Prompt suggestions (the greyed next-prompt text) are forced on with
+# CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=1, because their GrowthBook gate never
+# loads under a third-party endpoint. Set that variable to 0 to turn them off.
+# See PROMPT SUGGESTIONS below for the per-model caveat.
+#
+# Skill parity: custom models get Claude Code's bundled + installed-plugin skills,
+# but not the account skills Claude Code only syncs under a first-party model
+# (pdf, docx, xlsx, pptx, skill-creator, deep-research). This script re-exposes
+# those via a generated local plugin, .skills-plugin/ next to itself.
+
+set -euo pipefail
+
+# ---- tested Claude Code version ----
+# Last Claude Code version this script was checked against. On launch, a newer
+# installed version prints a one-line note (silence: CLAUDE_OR_NO_VERSION_CHECK=1).
+# When it fires, read the changelog entries since this version for anything that
+# touches the internals below, retest, then bump TESTED_CC_VERSION:
+#   - env vars: ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL/SMALL_FAST_MODEL/DEFAULT_*_MODEL,
+#     CLAUDE_CODE_SUBAGENT_MODEL, CLAUDE_CODE_EXTRA_BODY,
+#     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC (and the per-piece DISABLE_* vars),
+#     CLAUDE_CODE_DISABLE_FEATURE_FLAGS, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
+#     (and its 10k-uncached-token ceiling), CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+#     CLAUDE_CODE_MAX_OUTPUT_TOKENS (no auto-retry at a max_tokens error since 2.1.329)
+#   - auto mode: CLAUDE_CODE_AUTO_MODE_SERVER, CLAUDE_CODE_AUTO_MODE_MODEL,
+#     server-side `safeguards` verdicts, --permission-mode auto
+#   - skill sync: ~/.claude/skills/synced/<bucket>/manifest.json layout, the
+#     firstParty gate, ~/.claude/plugins/synced, --plugin-dir, plugin.json schema
+#   - session title gating on nonessential traffic
+#   - flags: --append-system-prompt, --dangerously-skip-permissions
+TESTED_CC_VERSION="2.1.329"
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# ---- model aliases (edit freely; IDs from https://openrouter.ai/models) ----
+# Pinned models get a `@provider` suffix. Suffix syntax is a wrapper feature: it's
+# stripped and sent as OpenRouter's provider.only (allow_fallbacks off) via
+# CLAUDE_CODE_EXTRA_BODY, so a request fails loudly instead of silently rerouting.
+declare -A MODELS=(
+  [gpt]="openai/gpt-6.2-sol"
+  [gpt-mini]="openai/gpt-6-luna"
+  [grok]="x-ai/grok-4.7"
+  [gemini]="google/gemini-4-neon"
+  [gemini-flash]="google/gemini-3.8-flash"
+  [deepseek]="deepseek/deepseek-v4.1-flash-1017@inference-net/us"  # stepfun intermittently 400s "The input you provided is invalid"
+  [qwen]="qwen/qwen4-max"
+  [kimi]="moonshotai/kimi-k3.1-pro"
+  [glm]="z-ai/glm-5.3-flash"
+  [claude]="anthropic/claude-sonnet-5.5"
+)
+ORDER=(gpt gpt-mini grok gemini gemini-flash deepseek qwen kimi glm claude)
+
+list() {
+  printf '%-14s %s\n' ALIAS MODEL
+  for k in "${ORDER[@]}"; do printf '%-14s %s\n' "$k" "${MODELS[$k]}"; done
+}
+
+# ---- load .env ----
+if [[ -f "$DIR/.env" ]]; then
+  set -a; . "$DIR/.env"; set +a
+fi
+: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY missing (put it in $DIR/.env)}"
+
+# ---- pick model ----
+choice="${1:-}"
+if [[ "$choice" == "--list" || "$choice" == "-l" ]]; then list; exit 0; fi
+
+if [[ -z "$choice" ]]; then
+  echo "Select a model:"
+  i=1
+  for k in "${ORDER[@]}"; do printf '  %2d) %-14s %s\n' "$i" "$k" "${MODELS[$k]}"; i=$((i+1)); done
+  read -rp "Number, alias, or OpenRouter model ID: " choice
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ORDER[@]} )); then
+    choice="${ORDER[choice-1]}"
+  fi
+else
+  shift
+fi
+
+# ---- optional @provider pin (e.g. deepseek@deepinfra) ----
+# A pin typed on the command line overrides the one baked into the alias.
+PROVIDER=""
+if [[ "$choice" == *@* ]]; then
+  PROVIDER="${choice##*@}"
+  choice="${choice%@*}"
+fi
+
+MODEL="${MODELS[$choice]:-$choice}"
+if [[ "$MODEL" == *@* ]]; then
+  : "${PROVIDER:=${MODEL##*@}}"
+  MODEL="${MODEL%@*}"
+fi
+
+if [[ "$MODEL" != */* ]]; then
+  echo "Unknown alias '$choice'. Run: $0 --list" >&2; exit 1
+fi
+
+# ---- permission mode ----
+# Auto mode is the default (see AUTO MODE below for why Claude Code's stock auto
+# mode does nothing here). `--no-auto` restores the old behaviour of bypassing
+# every permission prompt; so does an explicit --dangerously-skip-permissions or
+# any other explicit --permission-mode.
+AUTO_MODE=1
+AUTO_FLAG=0     # whether --permission-mode auto is already in $@
+FORCE_SKIP=0    # --no-auto: old behaviour, bypass every prompt
+ARGS=()
+while (( $# )); do
+  case "$1" in
+    --auto) AUTO_MODE=1; shift ;;
+    --no-auto) AUTO_MODE=0; FORCE_SKIP=1; shift ;;
+    --dangerously-skip-permissions) AUTO_MODE=0; ARGS+=("$1"); shift ;;
+    --permission-mode=auto) AUTO_MODE=1; AUTO_FLAG=1; ARGS+=("$1"); shift ;;
+    --permission-mode=*) AUTO_MODE=0; ARGS+=("$1"); shift ;;
+    --permission-mode)
+      ARGS+=("$1"); shift
+      if (( $# )); then
+        if [[ "$1" == "auto" ]]; then AUTO_MODE=1; AUTO_FLAG=1; else AUTO_MODE=0; fi
+        ARGS+=("$1"); shift
+      fi ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+# ---- reasoning effort (per alias) ----
+# OpenRouter exposes one cross-model knob, `reasoning.effort` (`reasoning.max_tokens`
+# is the token-budget alternative; per-model thinking budgets differ too much to pin
+# here). "max" spends ~95% of the output cap. Key on the alias, or on a provider
+# prefix a model ID starts with (so a bare `deepseek/...` ID gets it too).
+declare -A EFFORT=(
+  [deepseek]="max"
+)
+effort="${EFFORT[$choice]:-}"
+if [[ -z "$effort" ]]; then
+  for k in "${!EFFORT[@]}"; do
+    [[ "$MODEL" == "$k"/* ]] && effort="${EFFORT[$k]}" && break
+  done
+fi
+
+# ---- context window (per alias) ----
+# Claude Code only knows Claude models' windows. For anything else it warns
+# 'Model "..." isn't recognized · context assumed to be 1m tokens' and
+# auto-compacts against that guess. CLAUDE_CODE_MAX_CONTEXT_TOKENS gives it the
+# real window and silences the warning. Values are OpenRouter's context_length
+# for the alias's routing (the pinned provider's when the alias has a pin, since
+# providers can serve a smaller window than the model's max). A pin typed on the
+# command line, or a model ID not listed here, is looked up live from
+# OpenRouter. An explicit CLAUDE_CODE_MAX_CONTEXT_TOKENS in the environment wins.
+declare -A CONTEXT=(
+  [gpt]=1050000
+  [gpt-mini]=1050000
+  [grok]=500000
+  [gemini]=1048576
+  [gemini-flash]=1048576
+  [deepseek]=1040000     # inference-net/us serves 1,040,000 (model max is 1,048,576)
+  [qwen]=1000000
+  [kimi]=1048576
+  [glm]=262000           # tenstorrent/fp8; most providers serve 262,144
+  [claude]=1000000
+)
+# ---- output token cap (per alias) ----
+# Since 2.1.329 Claude Code no longer retries at the limit a `max_tokens` error
+# names, so a provider that takes fewer output tokens than Claude Code asks for
+# (32k by default) fails the request. CLAUDE_CODE_MAX_OUTPUT_TOKENS is exported
+# only when the cap is under OUTPUT_FLOOR: setting a big cap would make Claude
+# Code ask for it, and OpenRouter reserves credit for the full max_tokens.
+# Values: smallest max_completion_tokens across the alias's routing (only the
+# ones under the floor need listing; anything else is looked up live with the
+# context window). An explicit CLAUDE_CODE_MAX_OUTPUT_TOKENS wins.
+OUTPUT_FLOOR=32000
+declare -A MAXOUT=(
+  # none of the current aliases: every provider they route to takes >= 65,536
+)
+OUT="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-}"
+OUT_SET=0; [[ -n "$OUT" ]] && OUT_SET=1
+
+CTX="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}"
+ALIAS_PIN=""
+[[ "${MODELS[$choice]:-}" == *@* ]] && ALIAS_PIN="${MODELS[$choice]##*@}"
+if [[ -n "${CONTEXT[$choice]:-}" && "$PROVIDER" == "$ALIAS_PIN" ]]; then
+  [[ -z "$CTX" ]] && CTX="${CONTEXT[$choice]}"
+  [[ -z "$OUT" ]] && OUT="${MAXOUT[$choice]:-}"
+elif [[ -z "$CTX" || -z "$OUT" ]]; then
+  {
+    # Pinned: that provider's limits. Unpinned: the smallest any provider serves,
+    # since OpenRouter may route to any of them. Prints "<context> <output>".
+    read -r LIVE_CTX LIVE_OUT < <(python3 -I -c '
+import json, sys, urllib.request
+model, pin, key = sys.argv[1:4]
+req = urllib.request.Request(
+    "https://openrouter.ai/api/v1/models/" + model + "/endpoints",
+    headers={"Authorization": "Bearer " + key})
+try:
+    with urllib.request.urlopen(req, timeout=3) as r:
+        eps = json.load(r)["data"]["endpoints"]
+except Exception:
+    raise SystemExit
+if pin:
+    # "z-ai" pins every z-ai/* endpoint variant, as OpenRouter matches it.
+    eps = [e for e in eps if pin in (e.get("tag"), e.get("provider_name"))
+           or (e.get("tag") or "").startswith(pin + "/")]
+ctx = [e["context_length"] for e in eps if e.get("context_length")]
+out = [e["max_completion_tokens"] for e in eps if e.get("max_completion_tokens")]
+print(min(ctx) if ctx else "-", min(out) if out else "-")' "$MODEL" "$PROVIDER" "$OPENROUTER_API_KEY" 2>/dev/null || true) || true
+    [[ -z "$CTX" && "${LIVE_CTX:--}" != "-" ]] && CTX="$LIVE_CTX"
+    [[ -z "$OUT" && "${LIVE_OUT:--}" != "-" ]] && OUT="$LIVE_OUT"
+    [[ -z "$CTX" ]] && echo "→ note: couldn't look up the context window for $MODEL; Claude Code will assume one" >&2
+  }
+fi
+[[ -n "$CTX" ]] && export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CTX"
+if (( OUT_SET )); then
+  :   # user's value, already in the environment
+elif [[ "$OUT" =~ ^[0-9]+$ ]] && (( OUT < OUTPUT_FLOOR )); then
+  export CLAUDE_CODE_MAX_OUTPUT_TOKENS="$OUT"
+else
+  OUT=""
+fi
+
+# ---- point Claude Code at OpenRouter's Anthropic-compatible endpoint ----
+export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
+export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
+export ANTHROPIC_API_KEY=""   # must be explicitly empty so it isn't used
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
+export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL"
+
+# ---- keep Claude Code quiet without switching off terminal titles ----
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC puts Claude Code in "essential
+# traffic only" mode, and that one flag also disables non-traffic features:
+# the session title that names the terminal tab/window is gated on it, so the
+# title stayed a bare "Claude Code" and /resume rows lost their AI names.
+# Nothing else can switch the title feature back on, so disable the individual
+# pieces of nonessential traffic instead. (A parent Claude Code session can leak
+# the old variable into this process, so drop it explicitly.)
+unset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+export DISABLE_BUG_COMMAND=1
+export DISABLE_FEEDBACK_COMMAND=1
+export DISABLE_AUTOUPDATER=1
+export CLAUDE_CODE_DISABLE_FEATURE_FLAGS=1
+
+# ---- prompt suggestions (the greyed next-prompt ghost text) ----
+# Off by default here: the feature is gated on a GrowthBook flag that a
+# first-party sign-in populates, and the flag lookup never happens against
+# OpenRouter, so it silently reads as false. CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
+# short-circuits that gate. Claude Code generates each suggestion with the
+# session's own model and reuses its prompt cache (an Anthropic request costs
+# ~300 input tokens plus cache reads), so this is cheap; it is not routed to
+# ANTHROPIC_SMALL_FAST_MODEL. Set the variable to 0 to turn them off again.
+# Caveat: Claude Code suppresses suggestions once the previous reply used more
+# than 10k uncached tokens. Providers that report no prompt-cache hits (Gemini,
+# some others) hit that ceiling every turn, because the system prompt and tool
+# definitions alone exceed it, so suggestions stay absent for those models.
+if [[ -z "${CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION:-}" ]]; then
+  export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=1
+fi
+
+# ---- restore the skill parity Anthropic models get for free ----
+# With a first-party model, Claude Code also loads the account skills synced to
+# ~/.claude/skills/synced (pdf, docx, xlsx, pptx, skill-creator, deep-research, ...).
+# That sync is gated on `ke()==="firstParty"`, so a custom base URL silently drops
+# them — they sit on disk, loaded by nothing. Re-expose the ones that work without
+# Anthropic services as a normal local plugin, which loads under any model. Build it
+# on first run and rebuild whenever the sync writes a new manifest, so updates to
+# the skills flow through on their own.
+# (/schedule, /usage-credits, /insights etc. are account-entitlement upsells and
+# cannot be restored this way — don't expect them here.)
+SKILLS_PLUGIN="$DIR/.skills-plugin"
+# The sync root holds one bucket directory; dot-files (lock/marker) sit beside it.
+SYNC_DIR="$(find "$HOME/.claude/skills/synced" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
+SYNC_STAMP="$(md5sum "$SYNC_DIR/manifest.json" 2>/dev/null | cut -d' ' -f1)"
+
+# Skills worth carrying over: the ones whose work is done in files. Left out on
+# purpose: browser/computer-use (need tools this session doesn't have) and
+# docs/morning/import-memory (claude.ai connectors + memory, not third-party paths).
+SKILLS_KEEP=(pdf docx pptx xlsx skill-creator deep-research)
+
+build_skills_plugin() {
+  local d="$1"
+  rm -rf "$d"; mkdir -p "$d/.claude-plugin" "$d/skills"
+  printf '%s\n' \
+    '{"name":"claude-or-skills","version":"1.0.0",' \
+    ' "description":"Account skills (pdf, docx, office, research) re-exposed for third-party models"}' \
+    > "$d/.claude-plugin/plugin.json"
+  local s
+  for s in "${SKILLS_KEEP[@]}"; do
+    if [[ -f "$SYNC_DIR/$s/SKILL.md" ]]; then ln -s "$SYNC_DIR/$s" "$d/skills/$s"; fi
+  done
+  printf '%s\n' "${SYNC_STAMP:-none}" > "$d/.stamp"
+}
+
+if [[ -n "$SYNC_DIR" && -n "$SYNC_STAMP" ]]; then
+  if [[ ! -f "$SKILLS_PLUGIN/.stamp" || "$(cat "$SKILLS_PLUGIN/.stamp" 2>/dev/null)" != "$SYNC_STAMP" ]]; then
+    build_skills_plugin "$SKILLS_PLUGIN"
+  fi
+  # Same idea for the account plugins Claude Code syncs from claude.ai.
+  SYNCED_PLUGINS="$(find "$HOME/.claude/plugins/synced" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
+  PLUGIN_ARGS=(--plugin-dir "$SKILLS_PLUGIN")
+  [[ -n "$SYNCED_PLUGINS" ]] && PLUGIN_ARGS+=(--plugin-dir "$SYNCED_PLUGINS")
+else
+  PLUGIN_ARGS=()
+fi
+
+# ---- auto mode's classifier ----
+# In stock Claude Code, auto mode's safety check is server-side: each request
+# carries a `safeguards` field and the dangerous-tool-use beta, and Anthropic's
+# API answers with a verdict per tool call. OpenRouter's Anthropic-compatible
+# endpoint accepts the request but never returns a verdict, and Claude Code
+# treats "no verdict" as "nothing was flagged" — so auto mode silently approves
+# everything instead of checking it. CLAUDE_CODE_AUTO_MODE_SERVER=0 turns off
+# the server check, which makes Claude Code run its own classifier instead:
+# an ordinary model call, which a fast OpenRouter model can serve.
+# The classifier is anthropic/claude-haiku-5.5. Its provider is left to
+# OpenRouter (no preference is sent); set CLAUDE_OR_CLASSIFIER_PROVIDER to
+# force one.
+CLASSIFIER_MODEL="${CLAUDE_OR_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}"
+CLASSIFIER_PROVIDER="${CLAUDE_OR_CLASSIFIER_PROVIDER:-}"
+export CLAUDE_CODE_AUTO_MODE_SERVER=0
+export CLAUDE_CODE_AUTO_MODE_MODEL="$CLASSIFIER_MODEL"
+
+# A provider pin is request-body state, so it lands on the classifier request
+# too, and OpenRouter then refuses that one: "no allowed providers" for a
+# provider that doesn't serve the classifier model. Dropping the pin fixes that
+# but lets OpenRouter reroute the main model. Instead, add the classifier's
+# provider to the allow-list: `only` is filtered per model, so each model keeps
+# its own provider. Without a pin (nothing to filter against), ask for the
+# classifier's provider with `order` and leave fallbacks on, which only affects
+# models that provider actually serves. When the classifier is the main model
+# itself, one pin already covers both.
+PIN_EXTRA=""
+ORDER_PROVIDER=""
+if (( AUTO_MODE )); then
+  if [[ "$CLASSIFIER_MODEL" == "$MODEL" ]]; then
+    # Same model on both sides: a pin serves both, or pin both to the usual one.
+    if [[ -z "$PROVIDER" && -n "$CLASSIFIER_PROVIDER" ]]; then
+      PROVIDER="$CLASSIFIER_PROVIDER"
+      echo "→ auto mode: classifier is the model itself; pinning both to '$PROVIDER'" >&2
+    fi
+  elif [[ -n "$PROVIDER" ]]; then
+    PIN_EXTRA="$(python3 -I -c '
+import json, sys, urllib.request
+main_model, cls_model, pin, pref, key = sys.argv[1:6]
+def endpoints(model):
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/models/" + model + "/endpoints",
+        headers={"Authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=3) as r:
+        return json.load(r)["data"]["endpoints"]
+# As OpenRouter matches `only`: a slug selects its exact tag, every variant
+# under it ("z-ai" selects "z-ai/fp4"), or the display name.
+def matches(slug, e):
+    tag = e.get("tag") or ""
+    return slug in (tag, e.get("provider_name")) or tag.startswith(slug + "/")
+def serves(slug, eps):
+    return any(matches(slug, e) for e in eps)
+try:
+    main, cls = endpoints(main_model), endpoints(cls_model)
+except Exception:
+    raise SystemExit
+if pin and serves(pin, cls):
+    print(pin); raise SystemExit            # the pin already serves the classifier
+if pref and not serves(pref, cls):
+    pref = ""                               # preferred provider cannot serve it
+if pref and not serves(pref, main):
+    print(pref); raise SystemExit
+# A second allow-list entry must not also select a main-model endpoint, or the
+# main model could reroute there.
+cands = [(e.get("tag") or e.get("provider_name") or "", e.get("provider_name") or "")
+         for e in cls]
+cands = [c for c in cands if c[0] and not serves(c[0], main)]
+if cls_model.startswith("anthropic/"):
+    cands.sort(key=lambda c: 0 if c[1] == "Anthropic" else 1)
+if cands:
+    print(cands[0][0])' "$MODEL" "$CLASSIFIER_MODEL" "$PROVIDER" "$CLASSIFIER_PROVIDER" "$OPENROUTER_API_KEY" 2>/dev/null || true)"
+    if [[ -n "$PIN_EXTRA" && "$PIN_EXTRA" != "$PROVIDER" ]]; then
+      echo "→ auto mode: pin '$PROVIDER' kept; classifier routes to '$PIN_EXTRA'" >&2
+    elif [[ -z "$PIN_EXTRA" ]]; then
+      echo "→ auto mode: no provider found for the classifier; dropping pin '$PROVIDER' (main model may reroute)" >&2
+      PROVIDER=""
+    fi
+  elif [[ -z "$PROVIDER" && -n "$CLASSIFIER_PROVIDER" ]]; then
+    ORDER_PROVIDER="$CLASSIFIER_PROVIDER"
+    echo "→ auto mode: classifier prefers '$ORDER_PROVIDER'; main model keeps OpenRouter's routing" >&2
+  fi
+elif [[ -n "$PROVIDER" && "$CLASSIFIER_MODEL" != "$MODEL" ]]; then
+  echo "→ note: provider pin set, so shift+tab auto mode has no classifier; rerun with --auto" >&2
+fi
+
+
+if [[ -z "$PROVIDER" && -n "${CLAUDE_CODE_EXTRA_BODY:-}" ]]; then
+  CLAUDE_CODE_EXTRA_BODY="$(python3 -I -c '
+import json, sys
+try:
+    body = json.loads(sys.argv[1])
+except ValueError:
+    print(sys.argv[1]); raise SystemExit
+if isinstance(body, dict) and body.pop("provider", None) is not None:
+    print(json.dumps(body))
+else:
+    print(sys.argv[1])' "$CLAUDE_CODE_EXTRA_BODY")"
+  [[ "$CLAUDE_CODE_EXTRA_BODY" == "{}" ]] && unset CLAUDE_CODE_EXTRA_BODY
+  export CLAUDE_CODE_EXTRA_BODY
+fi
+
+# OpenRouter's Anthropic endpoint has no header/query way to choose a provider, so
+# merge provider preferences into the request body. Respect an EXTRA_BODY the user
+# already set by splicing both objects together instead of overwriting.
+if [[ -n "$PROVIDER" ]]; then
+  ONLY_JSON="\"$PROVIDER\""
+  # Second entry, if any, only ever matches the classifier model (see above).
+  [[ -n "$PIN_EXTRA" && "$PIN_EXTRA" != "$PROVIDER" ]] && ONLY_JSON="$ONLY_JSON,\"$PIN_EXTRA\""
+  PREFS="{\"only\":[$ONLY_JSON],\"allow_fallbacks\":false}"
+elif [[ -n "$ORDER_PROVIDER" ]]; then
+  PREFS="{\"order\":[\"$ORDER_PROVIDER\"],\"allow_fallbacks\":true}"
+fi
+if [[ -n "$PROVIDER" || -n "$ORDER_PROVIDER" ]]; then
+  if [[ -n "${CLAUDE_CODE_EXTRA_BODY:-}" ]]; then
+    export CLAUDE_CODE_EXTRA_BODY="$(python3 -I -c '
+import json, sys
+base, prefs = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+base["provider"] = {**base.get("provider", {}), **prefs}
+print(json.dumps(base))' "$CLAUDE_CODE_EXTRA_BODY" "$PREFS")"
+  else
+    export CLAUDE_CODE_EXTRA_BODY="{\"provider\":$PREFS}"
+  fi
+fi
+
+# Merge reasoning effort in, keeping whatever body the user or the pin built.
+if [[ -n "$effort" ]]; then
+  if [[ -n "${CLAUDE_CODE_EXTRA_BODY:-}" ]]; then
+    export CLAUDE_CODE_EXTRA_BODY="$(python3 -I -c '
+import json, sys
+base, effort = json.loads(sys.argv[1]), sys.argv[2]
+base["reasoning"] = {**base.get("reasoning", {}), "effort": effort}
+print(json.dumps(base))' "$CLAUDE_CODE_EXTRA_BODY" "$effort")"
+  else
+    export CLAUDE_CODE_EXTRA_BODY="$(printf '{"reasoning":{"effort":"%s"}}' "$effort")"
+  fi
+fi
+
+# ---- appended system prompt ----
+# A house instruction added to the end of Claude Code's own system prompt, on
+# every run. First match wins:
+#   CLAUDE_OR_SYSTEM_PROMPT       literal text to append
+#   CLAUDE_OR_SYSTEM_PROMPT_FILE  path to a file whose text is appended
+#   system-prompt.md              file next to this script (default)
+# CLAUDE_OR_SYSTEM_PROMPT=0 turns it off (also: false/off). Explicit
+# --system-prompt[-file] or --append-system-prompt[-file] args always win and
+# suppress this, so callers can still override the prompt per run.
+PROMPT_TEXT=""
+PROMPT_SKIP=0
+for a in ${ARGS[@]+"${ARGS[@]}"}; do
+  case "$a" in
+    --system-prompt|--system-prompt-file|--append-system-prompt|--append-system-prompt-file|--system-prompt=*|--append-system-prompt=*)
+      PROMPT_SKIP=1 ;;
+  esac
+done
+if (( ! PROMPT_SKIP )); then
+  case "${CLAUDE_OR_SYSTEM_PROMPT:-}" in
+    0|false|off) ;;
+    "")
+      if [[ -n "${CLAUDE_OR_SYSTEM_PROMPT_FILE:-}" ]]; then
+        if [[ ! -f "$CLAUDE_OR_SYSTEM_PROMPT_FILE" ]]; then
+          echo "CLAUDE_OR_SYSTEM_PROMPT_FILE not found: $CLAUDE_OR_SYSTEM_PROMPT_FILE" >&2; exit 1
+        fi
+        PROMPT_TEXT="$(cat "$CLAUDE_OR_SYSTEM_PROMPT_FILE")"
+      elif [[ -f "$DIR/system-prompt.md" ]]; then
+        PROMPT_TEXT="$(cat "$DIR/system-prompt.md")"
+      fi ;;
+    *) PROMPT_TEXT="$CLAUDE_OR_SYSTEM_PROMPT" ;;
+  esac
+fi
+[[ -n "$PROMPT_TEXT" ]] && set -- --append-system-prompt "$PROMPT_TEXT" "$@"
+
+if [[ -z "${CLAUDE_OR_NO_VERSION_CHECK:-}" ]]; then
+  CC_VERSION="$(claude --version 2>/dev/null | awk '{print $1}')" || CC_VERSION=""
+  if [[ -n "$CC_VERSION" && "$CC_VERSION" != "$TESTED_CC_VERSION" \
+        && "$(printf '%s\n%s\n' "$TESTED_CC_VERSION" "$CC_VERSION" | sort -V | tail -1)" == "$CC_VERSION" ]]; then
+    echo "→ note: Claude Code $CC_VERSION is newer than tested $TESTED_CC_VERSION; check changelog (see TESTED_CC_VERSION in $0)" >&2
+  fi
+fi
+
+echo "→ Claude Code via OpenRouter, model: $MODEL${PROVIDER:+ (provider: $PROVIDER, no fallback)}${effort:+ (reasoning effort: $effort)}${CTX:+ (context: $CTX)}${OUT:+ (max output: $OUT)}${PROMPT_TEXT:+ (custom system prompt)}" >&2
+if (( AUTO_MODE )); then
+  echo "→ auto permission mode; classifier: $CLAUDE_CODE_AUTO_MODE_MODEL" >&2
+  (( AUTO_FLAG )) || set -- --permission-mode auto "$@"
+  exec claude "${PLUGIN_ARGS[@]}" "$@"
+elif (( FORCE_SKIP )); then
+  exec claude "${PLUGIN_ARGS[@]}" --dangerously-skip-permissions "$@"
+fi
+exec claude "${PLUGIN_ARGS[@]}" "$@"
