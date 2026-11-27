@@ -1,7 +1,7 @@
 # claude-or
 
 Launch Claude Code against OpenRouter with any model (GPT, Grok, Gemini, DeepSeek, ...),
-or against your ChatGPT subscription.
+against DeepSeek's own API, or against your ChatGPT subscription.
 
 ## Setup
 
@@ -12,6 +12,7 @@ chmod 600 .env
 ```
 
 For the ChatGPT aliases only, skip `.env` and run `codex login` once instead.
+For `deepseek-api`, set `DEEPSEEK_API_KEY` (no OpenRouter key needed).
 
 ## Usage
 
@@ -21,6 +22,8 @@ For the ChatGPT aliases only, skip `.env` and run `codex login` once instead.
 ./claude-or --list          # show aliases
 ./claude-or --version       # print version
 ./claude-or x-ai/grok-4.7 -p "hi"   # any OpenRouter model ID
+./claude-or deepseek-api    # same DeepSeek model on DeepSeek's own API
+./claude-or deepseek:deepseek-v4-pro # any DeepSeek API model
 ./claude-or chatgpt         # ChatGPT subscription instead of OpenRouter billing
 ./claude-or chatgpt:gpt-6-luna      # any ChatGPT/Codex model slug
 ./claude-or --doctor        # check key, Codex login, Claude Code version, status line
@@ -44,6 +47,21 @@ gpt        openai/gpt-6.2-sol                    effort=high
 Options: `context=N`, `maxout=N`, `effort=LEVEL` (`effort=default` clears it).
 Replacing a built-in alias drops its built-in context/output values; they are
 then looked up from OpenRouter unless you give them.
+
+### DeepSeek's own API
+
+`deepseek-api` (and any `deepseek:<model>`, such as `deepseek:deepseek-v4-pro`)
+runs the same model against DeepSeek's Anthropic-compatible endpoint instead of
+OpenRouter. Set `DEEPSEEK_API_KEY` in `.env`; `deepseek-api` runs `deepseek-flash`,
+which is the same model as the OpenRouter `deepseek` alias.
+
+- Permission prompts are **skipped by default** here (`--dangerously-skip-permissions`):
+  the auto-mode classifier would be a DeepSeek model judging its own tool calls.
+  Pass `--auto` to use it anyway (classifier `deepseek-flash`; override with
+  `CLAUDE_OR_CLASSIFIER_MODEL`).
+- `@provider` pins don't apply, and no reasoning effort is sent by default
+  (`effort=LEVEL` in your aliases file becomes `output_config.effort`).
+- The status line shows your DeepSeek balance and this session's tokens.
 
 ### ChatGPT subscription
 
@@ -85,15 +103,19 @@ Each run shows usage at the bottom of Claude Code, refreshed every 30 seconds:
 ```
 gpt-6-luna · session $0.0027 · OpenRouter $1.09 credits left · key $33.70/$50 left (monthly)
 gpt-6-sol · session 26k tok, +0% 5h · ChatGPT Plus · 5h 18% used, resets 4h24m · week 3% used, resets 6d23h
+deepseek-flash · session 2.0M in (109.9M cached) + 172k out · DeepSeek $12.34 left
 ```
 
 - **session**: what this session has used so far, including side requests
   (safety classifier, titles, subagents). On OpenRouter it is the exact dollar
   cost OpenRouter reports per response; on ChatGPT, tokens plus the points of
-  each plan window used since the session started (whole percents only).
-  Totals are kept in `~/.cache/claude-or/sessions/`.
-- On OpenRouter, this sends requests through a small local pass-through that
-  forwards them unchanged; with the status line off they go direct.
+  each plan window used since the session started (whole percents only); on
+  DeepSeek, tokens only (it bills from a balance, not per response), split into
+  fresh input, cached input and output, since cache reads dominate long sessions
+  and cost far less. Totals are kept in `~/.cache/claude-or/sessions/`.
+- On OpenRouter and DeepSeek, this sends requests through a small local
+  pass-through that forwards them unchanged; with the status line off they go
+  direct.
 
 Results are cached in `~/.cache/claude-or/` (60s, kept across runs). If you
 already configure a `statusLine` or pass `--settings`, yours is used instead.

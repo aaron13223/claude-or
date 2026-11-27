@@ -8,6 +8,13 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
+Added
+- `deepseek-api` alias and `deepseek:<model>` IDs run DeepSeek's models on
+  DeepSeek's own Anthropic-compatible API with DEEPSEEK_API_KEY, instead of
+  OpenRouter. Permission prompts are skipped by default there; `--auto` uses a
+  DeepSeek classifier. The status line shows the DeepSeek balance and session
+  tokens, split into fresh input, cached input and output.
+
 Changed
 - The `deepseek` alias now runs at reasoning effort `high` instead of `max`,
   which spent most of the output cap thinking and made turns take much longer.

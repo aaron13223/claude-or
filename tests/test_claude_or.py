@@ -214,7 +214,7 @@ if sys.argv[1:2] == ["--version"]:
         f.write("x")
     print(os.environ.get("FAKE_CLAUDE_VERSION", "0.0.1") + " (Claude Code)")
     sys.exit(0)
-keep = [k for k in os.environ if k.startswith(("CLAUDE_CODE_", "ANTHROPIC_MODEL"))]
+keep = [k for k in os.environ if k.startswith(("CLAUDE_CODE_", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"))]
 with open(os.environ["FAKE_CLAUDE_OUT"], "w") as f:
     json.dump({"argv": sys.argv[1:], "env": {k: os.environ[k] for k in keep}}, f)
 """
@@ -236,7 +236,8 @@ class Launch(unittest.TestCase):
         self.out = os.path.join(self.tmp, "claude.json")
         self.versions = os.path.join(self.tmp, "versions")
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("CLAUDE_CODE_", "CLAUDE_OR_", "ANTHROPIC_", "OPENROUTER_", "XDG_", "CODEX_"))}
+               if not k.startswith(("CLAUDE_CODE_", "CLAUDE_OR_", "ANTHROPIC_", "OPENROUTER_",
+                                    "DEEPSEEK_", "XDG_", "CODEX_"))}
         env.update(HOME=self.home, XDG_CACHE_HOME=os.path.dirname(self.cache),
                    XDG_CONFIG_HOME=os.path.dirname(self.config),
                    PATH=os.path.join(self.tmp, "bin") + os.pathsep + env.get("PATH", ""),
@@ -307,6 +308,51 @@ class Launch(unittest.TestCase):
         r = self.run_or("nope")
         self.assertEqual(r.returncode, 1)
         self.assertIn("Unknown alias", r.stderr)
+
+    # -- DeepSeek's own API (`deepseek-api`, `deepseek:<model>`)
+    def test_deepseek_api_alias(self):
+        r = self.run_or("deepseek-api", "--auto", DEEPSEEK_API_KEY="sk-ds-test")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        env = self.launched()["env"]
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "sk-ds-test")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "deepseek-flash")
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1048576")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_MODE_MODEL"], "deepseek-flash")
+        self.assertNotIn("CLAUDE_CODE_EXTRA_BODY", env)
+        self.assertIn("--permission-mode", self.launched()["argv"])
+        self.assertNotIn("--dangerously-skip-permissions", self.launched()["argv"])
+
+    def test_deepseek_api_skips_permissions_by_default(self):
+        r = self.run_or("deepseek:deepseek-v4-pro", DEEPSEEK_API_KEY="sk-ds-test")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = self.launched()
+        self.assertEqual(got["env"]["ANTHROPIC_MODEL"], "deepseek-v4-pro")
+        self.assertEqual(got["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1048576")
+        self.assertIn("--dangerously-skip-permissions", got["argv"])
+        self.assertNotIn("--permission-mode", got["argv"])
+
+    def test_deepseek_api_needs_its_key(self):
+        r = self.run_or("deepseek-api")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("DEEPSEEK_API_KEY", r.stderr)
+
+    def test_deepseek_api_rejects_provider_pin(self):
+        r = self.run_or("deepseek-api@somewhere", DEEPSEEK_API_KEY="sk-ds-test")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("OpenRouter-only", r.stderr)
+
+    def test_deepseek_api_effort_uses_output_config(self):
+        with open(os.path.join(self.config, "aliases"), "w") as f:
+            f.write("ds  deepseek:deepseek-v4-pro  effort=high\n")
+        r = self.run_or("ds", "--no-auto", DEEPSEEK_API_KEY="sk-ds-test")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.body(), {"output_config": {"effort": "high"}})
+
+    def test_list_shows_deepseek_api(self):
+        r = self.run_or("--list")
+        self.assertIn("deepseek-api", r.stdout)
+        self.assertIn("deepseek:deepseek-flash", r.stdout)
 
     # -- CLAUDE_CODE_EXTRA_BODY
     def test_pin_and_effort_merge_into_user_body(self):
@@ -403,6 +449,22 @@ class Launch(unittest.TestCase):
                            env=dict(self.env, ANTHROPIC_BASE_URL="http://127.0.0.1:1"), timeout=30)
         self.assertEqual(r.stdout.strip(),
                          "gpt-x · session $0.0123 · OpenRouter $7.50 credits left · key $20.00/$50 left (monthly)")
+
+    def test_statusline_deepseek(self):
+        with open(os.path.join(self.cache, "usage-deepseek.json"), "w") as f:
+            json.dump({"t": time.time(), "data": {"balance": {"is_available": True, "balance_infos": [
+                {"currency": "CNY", "total_balance": "110.00"},
+                {"currency": "USD", "total_balance": "12.34"}]}}}, f)
+        os.makedirs(os.path.join(self.cache, "sessions"))
+        sid = "11111111-2222-3333-4444-555555555555"
+        with open(os.path.join(self.cache, "sessions", sid + ".json"), "w") as f:
+            json.dump({"backend": "deepseek", "input_tokens": 80000,
+                       "cache_read_input_tokens": 1000000, "output_tokens": 4000}, f)
+        r = subprocess.run([self.script, "--statusline", "deepseek"], capture_output=True, text=True,
+                           input=json.dumps({"session_id": sid, "model": {"display_name": "deepseek-flash"}}),
+                           env=dict(self.env, ANTHROPIC_BASE_URL="http://127.0.0.1:1"), timeout=30)
+        self.assertEqual(r.stdout.strip(),
+                         "deepseek-flash · session 80k in (1.0M cached) + 4k out · DeepSeek $12.34 left")
 
 
 if __name__ == "__main__":

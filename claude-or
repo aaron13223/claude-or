@@ -9,13 +9,22 @@
 #   ./claude-or deepseek@stepfun    # force a specific OpenRouter provider for one run
 #   ./claude-or deepseek            # deepseek runs at reasoning effort "high" (see EFFORT below)
 #   ./claude-or deepseek --no-auto  # bypass every permission prompt (the old default)
+#   ./claude-or deepseek-api        # same DeepSeek model on DeepSeek's own API (DEEPSEEK_API_KEY)
 #   ./claude-or chatgpt             # ChatGPT subscription (gpt-6-sol), no OpenRouter billing
 #   ./claude-or --list              # show aliases
 #   ./claude-or --version           # print wrapper version
 #   ./claude-or --doctor            # check key, Codex login, Claude Code, status line
 #   ./claude-or --check-aliases     # compare alias tables with OpenRouter (maintenance)
 #
-# Reads OPENROUTER_API_KEY from .env next to this script (OpenRouter models only).
+# Reads OPENROUTER_API_KEY from .env next to this script (OpenRouter models only),
+# and DEEPSEEK_API_KEY for the deepseek-api alias / `deepseek:<model>` IDs.
+
+# DeepSeek's own API: `deepseek-api` (or any `deepseek:<model>`, e.g.
+# deepseek:deepseek-v4-pro) runs the same model against api.deepseek.com with
+# DEEPSEEK_API_KEY instead of OpenRouter. That endpoint serves only DeepSeek's
+# models, so @provider pins do not apply. Permission prompts are skipped by
+# default there: the auto-mode classifier would be a DeepSeek model, which is
+# not a good safety check. Pass --auto to use it anyway.
 #
 # Default model: CLAUDE_OR_DEFAULT_MODEL (an alias or model ID, also settable in
 # .env) is what Enter picks in the menu, and what runs when the first argument
@@ -80,8 +89,9 @@ fi
 # each run injects a statusLine (via --settings) that calls back into this
 # script. It inherits Claude Code's env: with the local proxy running
 # (ANTHROPIC_BASE_URL on 127.0.0.1) it asks the proxy, which holds the real
-# credentials (the OpenRouter key, or Codex's refresh-safe login for wham/usage);
-# without it, it calls OpenRouter with ANTHROPIC_AUTH_TOKEN. Account results are
+# credentials (the OpenRouter key, the DeepSeek key, or Codex's refresh-safe
+# login for wham/usage); without it, it calls OpenRouter or DeepSeek's balance
+# endpoint with ANTHROPIC_AUTH_TOKEN. Account results are
 # cached per backend in ${XDG_CACHE_HOME:-~/.cache}/claude-or/ for 60s and kept
 # across runs, so a new session starts with the last known numbers and Claude
 # Code's 30s refresh costs at most one request a minute. A failed fetch shows the
@@ -89,8 +99,9 @@ fi
 # This session's share comes from sessions/<session_id>.json, which the proxy
 # writes after each response: exact dollars on OpenRouter, tokens on ChatGPT plus
 # the points of each plan window used since the session started (tracked in
-# sessions/<session_id>.plan.json, across window resets). The plan windows only
-# report whole percents, so small sessions read +0%.
+# sessions/<session_id>.plan.json, across window resets), tokens on DeepSeek
+# (its balance endpoint reports money, not a per-response charge). The plan
+# windows only report whole percents, so small sessions read +0%.
 usage_statusline_py() {
   cat <<'PY'
 import json, os, sys, time, urllib.request
@@ -117,6 +128,9 @@ def get(url):
 def fetch():
     if base.startswith("http://127.0.0.1:"):
         return get(base + "/claude-or/usage")
+    if backend == "deepseek":
+        # Going direct (no proxy): the token is DEEPSEEK_API_KEY.
+        return {"balance": get("https://api.deepseek.com/user/balance")}
     key = get("https://openrouter.ai/api/v1/key")["data"]
     credits = get("https://openrouter.ai/api/v1/credits")["data"]
     return {"key": {k: key.get(k) for k in ("limit", "limit_remaining", "limit_reset")},
@@ -194,6 +208,16 @@ def session_part(data):
             bits += ["+%d%% %s" % (d, label) for label, d in plan_delta(sid, data)
                      if d or label != "week"]
         return ", ".join(bits)
+    if backend == "deepseek":
+        # DeepSeek bills by balance, not per response, so only tokens are known.
+        # Cache reads dominate a long session (each turn re-reads the context)
+        # and are billed much cheaper, so they are shown apart from fresh input.
+        fresh = st.get("input_tokens", 0) + st.get("cache_creation_input_tokens", 0)
+        cached = st.get("cache_read_input_tokens", 0)
+        out = st.get("output_tokens", 0)
+        return "session %s in%s + %s out" % (tokens(fresh),
+                                             " (%s cached)" % tokens(cached) if cached else "",
+                                             tokens(out))
     cost = st.get("cost_usd")
     if cost is None:
         # Nothing recorded yet, or going direct (no proxy) so nothing can be.
@@ -221,6 +245,16 @@ def render(data, age):
             parts.append("credits unlimited")
         elif cr.get("has_credits"):
             parts.append("credits %s" % cr.get("balance"))
+    elif backend == "deepseek":
+        b = data.get("balance") or {}
+        infos = b.get("balance_infos") or []
+        # Show USD when the account holds both currencies, else the first one.
+        info = next((i for i in infos if i.get("currency") == "USD"), infos[0] if infos else {})
+        sym = {"USD": "$", "CNY": "¥"}.get(info.get("currency"), "")
+        if info.get("total_balance") is not None:
+            parts.append("DeepSeek %s%s left" % (sym, info["total_balance"]))
+        else:
+            parts.append("DeepSeek balance unavailable")
     else:
         c, k = data.get("credits") or {}, data.get("key") or {}
         left = (c.get("total_credits") or 0) - (c.get("total_usage") or 0)
@@ -301,6 +335,11 @@ declare -A MODELS=(
   [gemini]="google/gemini-4-neon"
   [gemini-flash]="google/gemini-3.8-flash"
   [deepseek]="deepseek/deepseek-v4.1-flash-1017@inference-net/us"  # stepfun intermittently 400s "The input you provided is invalid"
+  # `deepseek:` = DeepSeek's own Anthropic-compatible API, not OpenRouter. Slugs
+  # are DeepSeek's model IDs (deepseek-flash, deepseek-v4-pro); both are the same
+  # models OpenRouter resells. deepseek-flash is DeepSeek-V4.1-Flash-1017, the
+  # model behind the `deepseek` alias.
+  [deepseek-api]="deepseek:deepseek-flash"
   [qwen]="qwen/qwen4-max"
   [kimi]="moonshotai/kimi-k3.1-pro"
   [glm]="z-ai/glm-5.3-flash"
@@ -311,7 +350,7 @@ declare -A MODELS=(
   [chatgpt]="chatgpt:gpt-6-sol"
   [chatgpt-mini]="chatgpt:gpt-6-luna"
 )
-ORDER=(gpt gpt-mini grok gemini gemini-flash deepseek qwen kimi glm claude chatgpt chatgpt-mini)
+ORDER=(gpt gpt-mini grok gemini gemini-flash deepseek deepseek-api qwen kimi glm claude chatgpt chatgpt-mini)
 
 # ---- per-alias tables: reasoning effort, context window, output cap ----
 # Reasoning effort: OpenRouter exposes one cross-model knob, `reasoning.effort`
@@ -320,7 +359,9 @@ ORDER=(gpt gpt-mini grok gemini gemini-flash deepseek qwen kimi glm claude chatg
 # on the alias, or on a provider prefix a model ID starts with (so a bare
 # `deepseek/...` ID gets it too). DeepSeek sits at "high", not "max": on real
 # tasks the extra thinking buys little and turns take much longer. Users who
-# want "max" set it in their aliases file.
+# want "max" set it in their aliases file. On the DeepSeek API backend the same
+# value lands in `output_config.effort`, the only effort field that endpoint
+# takes; no default effort is set there (thinking is on by default).
 declare -A EFFORT=(
   [deepseek]="high"
 )
@@ -339,6 +380,7 @@ declare -A CONTEXT=(
   [gemini]=1048576
   [gemini-flash]=1048576
   [deepseek]=1040000     # inference-net/us serves 1,040,000 (model max is 1,048,576)
+  [deepseek-api]=1048576 # DeepSeek's docs say 1M tokens for both API models
   [qwen]=1000000
   [kimi]=1048576
   [glm]=262000           # tenstorrent/fp8; most providers serve 262,144
@@ -392,8 +434,8 @@ if [[ -f "$ALIASES_FILE" ]]; then
     if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
       echo "→ note: $where: skipped, bad alias name '$name' (letters, digits, . _ -)" >&2; continue
     fi
-    if [[ "$model" != */* && "$model" != chatgpt:?* ]]; then
-      echo "→ note: $where: skipped, '$model' is not a model ID (vendor/model or chatgpt:<slug>)" >&2; continue
+    if [[ "$model" != */* && "$model" != chatgpt:?* && "$model" != deepseek:?* ]]; then
+      echo "→ note: $where: skipped, '$model' is not a model ID (vendor/model, chatgpt:<slug>, deepseek:<model>)" >&2; continue
     fi
     [[ -z "${MODELS[$name]+x}" ]] && ORDER+=("$name")
     MODELS[$name]="$model"
@@ -537,6 +579,11 @@ for i in range(0, len(rows), 4):
         else:
             report("ok", alias, spec)
         continue
+    if model.startswith("deepseek:"):
+        # The DeepSeek API has no model-metadata endpoint; the context value
+        # comes from its docs, so there is nothing to compare here.
+        report("skip", alias, "%s (DeepSeek API, not checked)" % spec)
+        continue
     try:
         eps = endpoints(model, key, fresh=True)
     except urllib.error.HTTPError as e:
@@ -660,6 +707,28 @@ print("ok", "OpenRouter key works: $%.2f credits left%s" % (left, lim))' "$OPENR
     case "$v" in ok) ok "$f" ;; fail) fail "$f" ;; *) warn "$f" ;; esac
   fi
 
+  if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+    ok "no DEEPSEEK_API_KEY (deepseek-api is unavailable; OpenRouter's deepseek alias works)"
+  else
+    # Prints a status word, then a message; never the key.
+    read -r v f < <(python3 -I -c '
+import json, sys, urllib.error, urllib.request
+try:
+    req = urllib.request.Request("https://api.deepseek.com/user/balance",
+                                 headers={"Authorization": "Bearer " + sys.argv[1]})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        b = json.load(r)
+except urllib.error.HTTPError as e:
+    print("fail", "DeepSeek rejected the key (HTTP %d)" % e.code); raise SystemExit
+except Exception as e:
+    print("warn", "could not reach DeepSeek (%s)" % e); raise SystemExit
+infos = b.get("balance_infos") or []
+info = next((i for i in infos if i.get("currency") == "USD"), infos[0] if infos else {})
+sym = {"USD": "$", "CNY": "¥"}.get(info.get("currency"), "")
+print("ok", "DeepSeek key works: %s%s left" % (sym, info.get("total_balance")))' "$DEEPSEEK_API_KEY" 2>/dev/null || echo "warn DeepSeek check crashed")
+    case "$v" in ok) ok "$f" ;; fail) fail "$f" ;; *) warn "$f" ;; esac
+  fi
+
   f="${CODEX_HOME:-$HOME/.codex}"
   read -r v n < <(python3 -I -c '
 import json, sys, time, base64
@@ -770,12 +839,22 @@ if [[ "$MODEL" == chatgpt:?* ]]; then
   if [[ -n "$PROVIDER" ]]; then
     echo "@provider pins are OpenRouter-only; '$choice' runs on your ChatGPT subscription" >&2; exit 1
   fi
+elif [[ "$MODEL" == deepseek:?* ]]; then
+  BACKEND=deepseek
+  if [[ -n "$PROVIDER" ]]; then
+    echo "@provider pins are OpenRouter-only; '$choice' runs on DeepSeek's own API" >&2; exit 1
+  fi
 elif [[ "$MODEL" != */* ]]; then
   echo "Unknown alias '$choice'. Run: $0 --list" >&2; exit 1
 fi
 if [[ "$BACKEND" == openrouter ]]; then
   : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY missing (put it in $DIR/.env)}"
+elif [[ "$BACKEND" == deepseek ]]; then
+  : "${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY missing (put it in $DIR/.env)}"
 fi
+# The local proxy holds the credential for the pass-through tap.
+UPSTREAM_KEY="${OPENROUTER_API_KEY:-}"
+if [[ "$BACKEND" == deepseek ]]; then UPSTREAM_KEY="$DEEPSEEK_API_KEY"; fi
 
 # ---- permission mode ----
 # Auto mode is the default (see AUTO MODE below for why Claude Code's stock auto
@@ -785,16 +864,17 @@ fi
 AUTO_MODE=1
 AUTO_FLAG=0     # whether --permission-mode auto is already in $@
 FORCE_SKIP=0    # --no-auto: old behaviour, bypass every prompt
+PERM_SET=0      # the caller chose a permission mode (any of the flags below)
 ARGS=()
 while (( $# )); do
   case "$1" in
-    --auto) AUTO_MODE=1; shift ;;
-    --no-auto) AUTO_MODE=0; FORCE_SKIP=1; shift ;;
-    --dangerously-skip-permissions) AUTO_MODE=0; ARGS+=("$1"); shift ;;
-    --permission-mode=auto) AUTO_MODE=1; AUTO_FLAG=1; ARGS+=("$1"); shift ;;
-    --permission-mode=*) AUTO_MODE=0; ARGS+=("$1"); shift ;;
+    --auto) AUTO_MODE=1; PERM_SET=1; shift ;;
+    --no-auto) AUTO_MODE=0; FORCE_SKIP=1; PERM_SET=1; shift ;;
+    --dangerously-skip-permissions) AUTO_MODE=0; PERM_SET=1; ARGS+=("$1"); shift ;;
+    --permission-mode=auto) AUTO_MODE=1; AUTO_FLAG=1; PERM_SET=1; ARGS+=("$1"); shift ;;
+    --permission-mode=*) AUTO_MODE=0; PERM_SET=1; ARGS+=("$1"); shift ;;
     --permission-mode)
-      ARGS+=("$1"); shift
+      PERM_SET=1; ARGS+=("$1"); shift
       if (( $# )); then
         if [[ "$1" == "auto" ]]; then AUTO_MODE=1; AUTO_FLAG=1; else AUTO_MODE=0; fi
         ARGS+=("$1"); shift
@@ -803,6 +883,14 @@ while (( $# )); do
   esac
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
+
+# DeepSeek's own API has no useful classifier: auto mode would ask a DeepSeek
+# model to judge its own tool calls, so this backend skips permission prompts
+# by default. An explicit permission flag (--auto included) still wins.
+if [[ "$BACKEND" == deepseek ]] && (( ! PERM_SET )); then
+  AUTO_MODE=0; FORCE_SKIP=1
+  echo "→ deepseek API: skipping permission prompts (pass --auto to use the classifier)" >&2
+fi
 
 # ---- reasoning effort (EFFORT table at the top) ----
 effort="${EFFORT[$choice]:-}"
@@ -837,6 +925,10 @@ print(next((m["context_window"] for m in models
             if m.get("slug") == sys.argv[1] and m.get("context_window")), ""))' "${MODEL#chatgpt:}" 2>/dev/null || true)"
     [[ -z "$CTX" ]] && echo "→ note: ${MODEL#chatgpt:} not in Codex's model cache; Claude Code will assume a context window" >&2
   fi
+elif [[ "$BACKEND" == deepseek ]]; then
+  # DeepSeek's API publishes no limits endpoint. Both documented models serve
+  # 1M tokens, so a typed `deepseek:<model>` with no table entry gets that.
+  [[ -z "$CTX" ]] && CTX=1048576
 elif [[ -z "$CTX" || -z "$OUT" ]]; then
   {
     # Prints "<context> <output>" (see limits() in or_endpoints_py).
@@ -861,13 +953,16 @@ else
   OUT=""
 fi
 
-# ---- point Claude Code at OpenRouter's Anthropic-compatible endpoint ----
+# ---- point Claude Code at the backend's Anthropic-compatible endpoint ----
 # (ChatGPT mode sets the base URL and token once its proxy is up, just before
 # launch; the bare slug is the model name Claude Code shows.)
-MODEL_ID="${MODEL#chatgpt:}"
+MODEL_ID="${MODEL#chatgpt:}"; MODEL_ID="${MODEL_ID#deepseek:}"
 if [[ "$BACKEND" == openrouter ]]; then
   export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
   export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
+elif [[ "$BACKEND" == deepseek ]]; then
+  export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+  export ANTHROPIC_AUTH_TOKEN="$DEEPSEEK_API_KEY"
 fi
 export ANTHROPIC_API_KEY=""   # must be explicitly empty so it isn't used
 export ANTHROPIC_MODEL="$MODEL_ID"
@@ -974,6 +1069,9 @@ fi
 # In ChatGPT mode every request goes to the proxy, so the classifier must be a
 # ChatGPT model too: gpt-6-luna by default, and CLAUDE_OR_CLASSIFIER_MODEL takes
 # a bare or `chatgpt:` slug (an OpenRouter ID there is an error).
+# DeepSeek mode is the same story on DeepSeek's API (deepseek-flash by default),
+# but it is only reached with an explicit --auto: the default there is skipping
+# prompts, since a DeepSeek model is a poor judge of dangerous tool use.
 if [[ "$BACKEND" == chatgpt ]]; then
   CLASSIFIER_MODEL="${CLAUDE_OR_CLASSIFIER_MODEL:-gpt-6-luna}"
   CLASSIFIER_MODEL="${CLASSIFIER_MODEL#chatgpt:}"
@@ -981,6 +1079,13 @@ if [[ "$BACKEND" == chatgpt ]]; then
     echo "CLAUDE_OR_CLASSIFIER_MODEL=$CLASSIFIER_MODEL is an OpenRouter ID; ChatGPT mode needs a ChatGPT slug (e.g. gpt-6-luna)" >&2; exit 1
   fi
   CLASSIFIER_PROVIDER=""   # no pins here, so the reconciliation below is a no-op
+elif [[ "$BACKEND" == deepseek ]]; then
+  CLASSIFIER_MODEL="${CLAUDE_OR_CLASSIFIER_MODEL:-deepseek-flash}"
+  CLASSIFIER_MODEL="${CLASSIFIER_MODEL#deepseek:}"
+  if [[ "$CLASSIFIER_MODEL" == */* ]]; then
+    echo "CLAUDE_OR_CLASSIFIER_MODEL=$CLASSIFIER_MODEL is an OpenRouter ID; DeepSeek mode needs a DeepSeek model (e.g. deepseek-flash)" >&2; exit 1
+  fi
+  CLASSIFIER_PROVIDER=""
 else
   CLASSIFIER_MODEL="${CLAUDE_OR_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}"
   CLASSIFIER_PROVIDER="${CLAUDE_OR_CLASSIFIER_PROVIDER:-}"
@@ -1064,7 +1169,7 @@ fi
 if [[ -n "${CLAUDE_CODE_EXTRA_BODY:-}" || -n "$PREF_MODE" || -n "$effort" ]]; then
   if ! BODY="$(python3 -I -c '
 import json, sys
-raw, mode, effort, providers = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+raw, mode, effort, backend, *providers = sys.argv[1:]
 body = {}
 if raw:
     try:
@@ -1083,9 +1188,12 @@ if mode == "only":
 elif mode == "order":
     body["provider"] = {"order": providers, "allow_fallbacks": True}
 if effort:
-    r = body.get("reasoning")
-    body["reasoning"] = {**(r if isinstance(r, dict) else {}), "effort": effort}
-print(json.dumps(body) if body else "")' "${CLAUDE_CODE_EXTRA_BODY:-}" "$PREF_MODE" "$effort" \
+    # The DeepSeek endpoint takes only output_config.effort (reasoning is an
+    # OpenRouter extension there; an unknown key is not worth risking).
+    field = "output_config" if backend == "deepseek" else "reasoning"
+    r = body.get(field)
+    body[field] = {**(r if isinstance(r, dict) else {}), "effort": effort}
+print(json.dumps(body) if body else "")' "${CLAUDE_CODE_EXTRA_BODY:-}" "$PREF_MODE" "$effort" "$BACKEND" \
       ${PREF_PROVIDERS[@]+"${PREF_PROVIDERS[@]}"})"; then
     exit 1
   fi
@@ -1126,7 +1234,7 @@ if (( ! PROMPT_SKIP )); then
 fi
 [[ -n "$PROMPT_TEXT" ]] && set -- --append-system-prompt "$PROMPT_TEXT" "$@"
 
-# ---- local proxy: ChatGPT subscription, OpenRouter cost tap ----
+# ---- local proxy: ChatGPT subscription, OpenRouter cost tap, DeepSeek usage ----
 # Claude Code only speaks Anthropic Messages; a ChatGPT plan is only reachable
 # through the Codex backend (chatgpt.com/backend-api/codex/responses), which
 # speaks the OpenAI Responses API with the Codex CLI's OAuth tokens. So ChatGPT
@@ -1147,9 +1255,11 @@ local_proxy_py() {
   cat <<'PY'
 import base64, fcntl, http.server, json, os, re, sys, threading, time, urllib.error, urllib.request, uuid
 
-MODE = os.environ.get("CLAUDE_OR_PROXY_MODE", "chatgpt")   # or "openrouter" (pass-through tap)
+MODE = os.environ.get("CLAUDE_OR_PROXY_MODE", "chatgpt")   # or "openrouter"/"deepseek" (pass-through taps)
 OR_BASE = "https://openrouter.ai/api"
-OR_KEY = os.environ.pop("CLAUDE_OR_UPSTREAM_KEY", "")
+DS_BASE = "https://api.deepseek.com/anthropic"
+DS_BALANCE_URL = "https://api.deepseek.com/user/balance"
+UP_KEY = os.environ.pop("CLAUDE_OR_UPSTREAM_KEY", "")   # the pass-through backend's key
 
 UPSTREAM = "https://chatgpt.com/backend-api/codex/responses"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"   # what Codex's /status reads
@@ -1547,16 +1657,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.split("?")[0] != "/claude-or/usage":
-            if MODE == "openrouter":
+            if MODE in ("openrouter", "deepseek"):
                 return self.passthrough("GET", None, None) if self.authorised() else self.send_err(401, "bad proxy token")
             return self.send_json(200, {"ok": True})
         # For the status line: it shares this process's token handling, so it never
         # refreshes (and rotates) the Codex login on its own.
         if not self.authorised():
             return self.send_err(401, "bad proxy token")
+        if MODE == "deepseek":
+            try:
+                h = {"Authorization": "Bearer " + UP_KEY}
+                with urllib.request.urlopen(urllib.request.Request(DS_BALANCE_URL, headers=h), timeout=5) as r:
+                    balance = json.load(r)
+            except Exception as e:
+                return self.send_err(502, "usage: %s" % e)
+            # DeepSeek has no per-response charge, only the account balance.
+            return self.send_json(200, {"balance": balance})
         if MODE == "openrouter":
             try:
-                h = {"Authorization": "Bearer " + OR_KEY}
+                h = {"Authorization": "Bearer " + UP_KEY}
                 with urllib.request.urlopen(urllib.request.Request(OR_BASE + "/v1/key", headers=h), timeout=5) as r:
                     key = json.load(r)["data"]
                 with urllib.request.urlopen(urllib.request.Request(OR_BASE + "/v1/credits", headers=h), timeout=5) as r:
@@ -1592,9 +1711,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
         except ValueError:
             body = {}
-            if MODE != "openrouter":
+            if MODE not in ("openrouter", "deepseek"):
                 return self.send_err(400, "invalid JSON")
-        if MODE == "openrouter":
+        if MODE in ("openrouter", "deepseek"):
             return self.passthrough("POST", raw, body)
         sid = session_id(body)
         path = self.path.split("?")[0]
@@ -1658,22 +1777,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    # OpenRouter mode: forward bytes unchanged, only reading usage (which carries
-    # OpenRouter's exact `cost`) off the final message_delta / JSON body.
+    # Pass-through modes (OpenRouter, DeepSeek): forward bytes unchanged, only
+    # reading usage off the final message_delta / JSON body. OpenRouter's usage
+    # carries an exact `cost`; DeepSeek's carries tokens only (it bills balance).
     HOP = {"host", "content-length", "authorization", "x-api-key", "connection", "keep-alive",
            "accept-encoding", "transfer-encoding", "te", "upgrade", "proxy-connection"}
 
     def passthrough(self, method, raw, body):
+        base = DS_BASE if MODE == "deepseek" else OR_BASE
         headers = {k: v for k, v in self.headers.items() if k.lower() not in self.HOP}
-        headers["Authorization"] = "Bearer " + OR_KEY
+        headers["Authorization"] = "Bearer " + UP_KEY
         headers["Accept-Encoding"] = "identity"   # so usage can be read off the stream
-        req = urllib.request.Request(OR_BASE + self.path, raw if method == "POST" else None, headers, method=method)
+        req = urllib.request.Request(base + self.path, raw if method == "POST" else None, headers, method=method)
         try:
             resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as e:
             resp = e   # pass errors through as-is so Claude Code's own handling applies
         except Exception as e:
-            return self.send_err(502, "OpenRouter unreachable: %s" % e)
+            return self.send_err(502, "%s unreachable: %s" % ("DeepSeek" if MODE == "deepseek" else "OpenRouter", e))
         sid = session_id(body) if body else None
         try:
             status = getattr(resp, "status", None) or resp.code
@@ -1755,18 +1876,19 @@ print(json.dumps({"statusLine": {"type": "command", "command": cmd, "refreshInte
 fi
 
 # ---- start the local proxy ----
-# ChatGPT mode always needs it (translation). OpenRouter mode uses it only to show
-# what this session cost: Claude Code drops OpenRouter's per-response `cost` before
-# writing transcripts, so the proxy forwards requests byte-for-byte and adds each
-# response's cost to the session's total (keyed by the session id Claude Code puts
-# in metadata.user_id). It also covers side requests (classifier, titles,
-# suggestions, subagents), which never reach the transcript. Without the status
-# line there is nothing to show, so OpenRouter then goes direct; if the proxy
-# fails to start it also goes direct, without the session cost.
+# ChatGPT mode always needs it (translation). OpenRouter and DeepSeek modes use
+# it only for the status line: Claude Code drops OpenRouter's per-response `cost`
+# before writing transcripts, so the proxy forwards requests byte-for-byte and
+# adds each response's cost to the session's total (keyed by the session id
+# Claude Code puts in metadata.user_id). DeepSeek has no cost field, so there it
+# counts tokens and answers the status line's balance query. It also covers side
+# requests (classifier, titles, suggestions, subagents), which never reach the
+# transcript. Without the status line there is nothing to show, so both go
+# direct; if the proxy fails to start it also goes direct, without live usage.
 start_proxy() {
   PROXY_SECRET="$(head -c 32 /dev/urandom | md5sum | cut -d' ' -f1)"
   exec {PROXY_FD}< <(CLAUDE_OR_PROXY_SECRET="$PROXY_SECRET" CLAUDE_OR_PROXY_MODE="$BACKEND" \
-                     CLAUDE_OR_UPSTREAM_KEY="${OPENROUTER_API_KEY:-}" \
+                     CLAUDE_OR_UPSTREAM_KEY="$UPSTREAM_KEY" \
                      exec python3 -I -c "$(local_proxy_py)" "$$" \
                        </dev/null 2>>"${CLAUDE_OR_PROXY_LOG:-/dev/null}")
   PROXY_PORT=""
@@ -1792,7 +1914,7 @@ elif [[ -n "$SL_SETTINGS" ]]; then
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
     export ANTHROPIC_AUTH_TOKEN="$PROXY_SECRET"
   else
-    echo "→ note: usage proxy failed to start; going direct to OpenRouter (no session cost)" >&2
+    echo "→ note: usage proxy failed to start; going direct (no live balance or session total)" >&2
   fi
 fi
 [[ -n "$SL_SETTINGS" ]] && set -- --settings "$SL_SETTINGS" "$@"
@@ -1805,7 +1927,11 @@ if [[ -z "${CLAUDE_OR_NO_VERSION_CHECK:-}" ]]; then
   fi
 fi
 
-VIA="OpenRouter"; [[ "$BACKEND" == chatgpt ]] && VIA="ChatGPT subscription"
+VIA="OpenRouter"
+case "$BACKEND" in
+  chatgpt) VIA="ChatGPT subscription" ;;
+  deepseek) VIA="DeepSeek API" ;;
+esac
 echo "→ Claude Code via $VIA, model: $MODEL_ID${PROVIDER:+ (provider: $PROVIDER, no fallback)}${effort:+ (reasoning effort: $effort)}${CTX:+ (context: $CTX)}${OUT:+ (max output: $OUT)}${PROMPT_TEXT:+ (custom system prompt)}" >&2
 if (( AUTO_MODE )); then
   echo "→ auto permission mode; classifier: $CLAUDE_CODE_AUTO_MODE_MODEL" >&2
