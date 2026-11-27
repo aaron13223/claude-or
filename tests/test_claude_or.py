@@ -312,8 +312,14 @@ class Launch(unittest.TestCase):
     def test_pin_and_effort_merge_into_user_body(self):
         r = self.run_or("deepseek", "--no-auto", CLAUDE_CODE_EXTRA_BODY='{"foo":1,"provider":{"sort":"price"}}')
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.body(), {"foo": 1, "reasoning": {"effort": "max"}, "provider": {
+        self.assertEqual(self.body(), {"foo": 1, "reasoning": {"effort": "high"}, "provider": {
             "sort": "price", "only": ["inference-net/us"], "allow_fallbacks": False}})
+
+    def test_deepseek_default_effort_is_high(self):
+        # The alias default, not just the merge: max made DeepSeek think far too long.
+        r = self.run_or("deepseek", "--no-auto")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.body()["reasoning"], {"effort": "high"})
 
     def test_invalid_user_body_with_pin_stops_launch(self):
         r = self.run_or("deepseek", "--no-auto", CLAUDE_CODE_EXTRA_BODY="not json")

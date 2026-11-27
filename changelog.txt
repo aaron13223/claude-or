@@ -8,7 +8,10 @@ Newest release first. Dates are YYYY-MM-DD.
 
 [Unreleased]
 ------------
-
+Changed
+- The `deepseek` alias now runs at reasoning effort `high` instead of `max`,
+  which spent most of the output cap thinking and made turns take much longer.
+  Set `effort=max` in your aliases file to restore the old behaviour.
 
 [1.5.0] - 2026-11-21
 --------------------

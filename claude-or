@@ -7,7 +7,7 @@
 #   ./claude-or gpt                 # use an alias
 #   ./claude-or x-ai/grok-4.7 -p "hi" # any OpenRouter model ID; extra args go to claude
 #   ./claude-or deepseek@stepfun    # force a specific OpenRouter provider for one run
-#   ./claude-or deepseek            # deepseek runs at reasoning effort "max" (see EFFORT below)
+#   ./claude-or deepseek            # deepseek runs at reasoning effort "high" (see EFFORT below)
 #   ./claude-or deepseek --no-auto  # bypass every permission prompt (the old default)
 #   ./claude-or chatgpt             # ChatGPT subscription (gpt-6-sol), no OpenRouter billing
 #   ./claude-or --list              # show aliases
@@ -318,9 +318,11 @@ ORDER=(gpt gpt-mini grok gemini gemini-flash deepseek qwen kimi glm claude chatg
 # (`reasoning.max_tokens` is the token-budget alternative; per-model thinking
 # budgets differ too much to pin here). "max" spends ~95% of the output cap. Key
 # on the alias, or on a provider prefix a model ID starts with (so a bare
-# `deepseek/...` ID gets it too).
+# `deepseek/...` ID gets it too). DeepSeek sits at "high", not "max": on real
+# tasks the extra thinking buys little and turns take much longer. Users who
+# want "max" set it in their aliases file.
 declare -A EFFORT=(
-  [deepseek]="max"
+  [deepseek]="high"
 )
 # Context window: Claude Code only knows Claude models' windows. For anything
 # else it warns 'Model "..." isn't recognized · context assumed to be 1m tokens'
