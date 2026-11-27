@@ -59,6 +59,25 @@ backend.
 - `@provider` pins don't apply, and Claude Code's WebSearch tool is not available.
 - `CLAUDE_OR_PROXY_LOG=<file>` logs proxy requests and errors.
 
+### Browser automation with custom models
+
+Claude in Chrome is not available through this wrapper's OpenRouter or ChatGPT
+credentials. Its native extension needs a Claude Code subscription sign-in; adding
+its `chrome-browser` skill would add instructions, not the browser tools. Passing
+`--chrome` to `claude-or` does not remove that authentication requirement.
+
+For browser automation with a custom model, configure an independent browser MCP
+server, such as [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp).
+Then start `./claude-or gpt` (or another model), check the connection with `/mcp`,
+and ask Claude to use Chrome DevTools. If you have its plugin installed, you can
+also invoke `/chrome-devtools-mcp:chrome-devtools`. This uses Chrome DevTools MCP,
+not the Claude in Chrome extension; follow the MCP server's setup instructions to
+connect it to the browser.
+
+For native Claude in Chrome, start a separate, direct subscription session with
+`claude --chrome`, signed in to the same Claude account as the extension. See
+[Claude in Chrome requirements](https://code.claude.com/docs/en/chrome).
+
 ### Usage status line
 
 Each run shows usage at the bottom of Claude Code, refreshed every 30 seconds:

@@ -12,6 +12,8 @@ Changed
 - The `deepseek` alias now runs at reasoning effort `high` instead of `max`,
   which spent most of the output cap thinking and made turns take much longer.
   Set `effort=max` in your aliases file to restore the old behaviour.
+- Document Chrome DevTools MCP as the browser automation path for custom models,
+  and clarify why native Claude in Chrome needs a direct subscription session.
 
 [1.5.0] - 2026-11-21
 --------------------
